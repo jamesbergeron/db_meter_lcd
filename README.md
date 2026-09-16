@@ -66,8 +66,21 @@ python3 db_meter_gui.py
 
 - **Simulation Mode Checkbox**: Toggle to test the app with realistic randomized sound level simulation.
 - **⚡ Test >105dB Spike**: Instantly triggers a high-decibel acoustic spike in simulation mode to verify the red flashing alarm visual effects.
+- **💬 Discord Alerts**: Opens Discord Webhook configuration popup to send automated instant notifications to a Discord channel or user when decibels exceed 105 dB.
 - **Theme Dropdown**: Switch between *Matrix Green*, *Retro Amber*, *Cyber Cyan*, and *Crimson Red*.
 - **Reset Stats**: Clears the recorded Min, Max, and Average telemetry readouts.
+
+---
+
+## 💬 Setting Up Discord Webhook Notifications
+
+1. Open Discord, go to **Server Settings** → **Integrations** → **Webhooks** → **Create Webhook**.
+2. Copy the generated Webhook URL.
+3. In the Sound Level Meter GUI, click the **💬 Discord Alerts** button.
+4. Check **Enable Discord Notifications**.
+5. Paste your **Webhook URL**.
+6. (Optional) Paste your Discord User ID (Right-click your profile in Discord → *Copy User ID*) to get pinged `<@USER_ID>` whenever an alarm occurs.
+7. Click **🧪 Send Test Alert** to test, then click **Save & Close**.
 
 ---
 

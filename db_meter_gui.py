@@ -10,6 +10,9 @@ import os
 import time
 import math
 import random
+import json
+import urllib.request
+import urllib.parse
 import threading
 import queue
 from datetime import datetime
@@ -43,10 +46,60 @@ def calculate_crc(data: bytes) -> bytes:
 
 
 # ==========================================
+# Discord Webhook Notification Utility
+# ==========================================
+def send_discord_webhook(webhook_url: str, db_value: float, threshold: float = 105.0, user_id: str = "", is_test: bool = False):
+    """Sends a rich embedded notification to a Discord webhook."""
+    if not webhook_url or not webhook_url.startswith("http"):
+        return False, "Invalid Webhook URL"
+
+    try:
+        user_mention = f"<@{user_id.strip()}> " if user_id.strip() else ""
+        title = "🧪 TEST DISCORD ALERT" if is_test else "🚨 HIGH SOUND PRESSURE ALARM ALERT!"
+        desc = (
+            f"Test notification from Sound Level Monitor.\nWebhook is working correctly!"
+            if is_test
+            else f"Measured noise level of **{db_value:.1f} dB** has exceeded the threshold of **{threshold:.1f} dB**!"
+        )
+
+        payload = {
+            "content": f"{user_mention}**{title}**",
+            "embeds": [
+                {
+                    "title": "🔊 Noise Level Monitor Alert",
+                    "description": desc,
+                    "color": 3447003 if is_test else 16711680,  # Blue for test, Red for alarm
+                    "fields": [
+                        {"name": "Current Reading", "value": f"**{db_value:.1f} dB**", "inline": True},
+                        {"name": "Threshold Limit", "value": f"**{threshold:.1f} dB**", "inline": True},
+                    ],
+                    "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ"),
+                    "footer": {"text": "Digital Sound Level Monitor • Modbus RTU"}
+                }
+            ]
+        }
+
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(
+            webhook_url,
+            data=data,
+            headers={
+                'Content-Type': 'application/json',
+                'User-Agent': 'SoundMeter/1.0'
+            }
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return True, "Alert sent successfully!"
+
+    except Exception as e:
+        return False, str(e)
+
+
+# ==========================================
 # Serial / Modbus Reader Worker Thread
 # ==========================================
 class ModbusReaderThread(threading.Thread):
-    def __init__(self, data_queue, port="/dev/ttyACM0", baudrate=9600, slave_addr=1, poll_interval=0.2, simulation_mode=True):
+    def __init__(self, data_queue, port="COM6", baudrate=9600, slave_addr=1, poll_interval=0.2):
         super().__init__(daemon=True)
         self.data_queue = data_queue
         self.port = port
@@ -54,21 +107,14 @@ class ModbusReaderThread(threading.Thread):
         self.slave_addr = slave_addr
         self.poll_interval = poll_interval
         self.running = True
-        self.simulation_mode = simulation_mode or not HAS_SERIAL
         self.ser = None
         self._lock = threading.Lock()
         self._wake_event = threading.Event()
 
-        # Simulation noise generator variables
-        self._sim_base = 65.0
-        self._sim_target = 65.0
-        self._sim_alarm_timer = 0
-
-    def set_config(self, port, baudrate, simulation_mode, slave_addr=1):
+    def set_config(self, port, baudrate, slave_addr=1):
         with self._lock:
             self.port = port
             self.baudrate = baudrate
-            self.simulation_mode = simulation_mode
             self.slave_addr = slave_addr
             if self.ser:
                 try:
@@ -76,20 +122,12 @@ class ModbusReaderThread(threading.Thread):
                 except Exception:
                     pass
                 self.ser = None
-        # Drain any leftover stale messages from data queue
+        # Drain any leftover messages from queue
         try:
             while not self.data_queue.empty():
                 self.data_queue.get_nowait()
         except Exception:
             pass
-        self._wake_event.set()
-
-    def trigger_sim_spike(self):
-        """Forces a high dB spike in simulation mode to test >105 dB alarm."""
-        with self._lock:
-            val = random.uniform(106.5, 114.0)
-            self._sim_base = val
-            self._sim_target = val
         self._wake_event.set()
 
     def stop(self):
@@ -100,33 +138,18 @@ class ModbusReaderThread(threading.Thread):
         while self.running:
             self._wake_event.clear()
             with self._lock:
-                is_sim = self.simulation_mode or not HAS_SERIAL
                 port = self.port
                 baudrate = self.baudrate
                 slave_addr = self.slave_addr
 
-            if is_sim:
-                # Generate realistic fluctuating sound level
-                if random.random() < 0.05:
-                    self._sim_target = random.choice([
-                        random.uniform(45.0, 75.0),
-                        random.uniform(85.0, 98.0),
-                        random.uniform(105.5, 112.5)
-                    ])
-                
-                diff = self._sim_target - self._sim_base
-                self._sim_base += diff * 0.15 + random.uniform(-0.4, 0.4)
-                self._sim_base = max(30.0, min(120.0, self._sim_base))
-                
-                db_val = round(self._sim_base, 1)
+            if not HAS_SERIAL:
                 self.data_queue.put({
-                    'status': 'OK',
-                    'db': db_val,
-                    'mode': 'SIMULATION',
+                    'status': 'ERROR',
+                    'error': 'pyserial module is missing! Run: pip install pyserial',
                     'port': port,
                     'timestamp': datetime.now().strftime("%H:%M:%S")
                 })
-                self._wake_event.wait(self.poll_interval)
+                self._wake_event.wait(1.0)
                 continue
 
             # Real Serial Modbus RTU Read
@@ -149,7 +172,7 @@ class ModbusReaderThread(threading.Thread):
                         timeout=0.2
                     )
 
-                # Frame: [SlaveID, Func(0x03), RegHi, RegLo, CountHi, CountLo]
+                # Query Frame: [SlaveID, Func(0x03), RegHi, RegLo, CountHi, CountLo]
                 query_payload = bytes([slave_addr, 0x03, 0x00, 0x00, 0x00, 0x01])
                 query_frame = calculate_crc(query_payload)
 
@@ -168,7 +191,6 @@ class ModbusReaderThread(threading.Thread):
                     self.data_queue.put({
                         'status': 'OK',
                         'db': db_val,
-                        'mode': 'HARDWARE',
                         'port': port,
                         'timestamp': timestamp
                     })
@@ -283,6 +305,13 @@ class SoundMeterApp:
         self.peak_hold_db = 30.0
         self.peak_hold_timer = 0
 
+        # Discord Webhook State
+        self.discord_enabled = False
+        self.discord_webhook_url = ""
+        self.discord_user_id = ""
+        self.discord_cooldown = 60  # seconds
+        self.last_discord_alert_time = 0.0
+
         # Queue & Thread
         self.data_queue = queue.Queue()
         default_port = self.detect_default_port()
@@ -290,7 +319,7 @@ class SoundMeterApp:
             data_queue=self.data_queue,
             port=default_port,
             baudrate=9600,
-            simulation_mode=True
+            slave_addr=1
         )
 
         self.setup_ui()
@@ -372,8 +401,10 @@ class SoundMeterApp:
 
         self.lbl_mode_badge = tk.Label(
             self.status_container,
-            text="SIMULATION MODE" if not HAS_SERIAL else "HARDWARE",
+            text="CONNECTING...",
             font=("Segoe UI", 9, "bold"),
+            bg="#f0ad4e",
+            fg="#ffffff",
             bd=1,
             relief=tk.SOLID,
             padx=6, pady=2
@@ -455,41 +486,39 @@ class SoundMeterApp:
         # Serial Port Selector
         tk.Label(self.control_frame, text="Port:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(5, 2))
         self.cbo_port = ttk.Combobox(self.control_frame, values=self.get_port_list(), width=13, postcommand=self.refresh_port_list)
-        self.cbo_port.set(self.reader_thread.port)
+        self.cbo_port.set("COM6" if sys.platform.startswith('win') else "/dev/ttyACM0")
         self.cbo_port.pack(side=tk.LEFT, padx=(0, 10))
+        self.cbo_port.bind("<<ComboboxSelected>>", lambda e: self.apply_serial_settings())
 
         # Baud Rate Selector
         tk.Label(self.control_frame, text="Baud:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(5, 2))
         self.cbo_baud = ttk.Combobox(self.control_frame, values=["2400", "4800", "9600", "19200", "38400", "115200"], width=7)
         self.cbo_baud.set("9600")
         self.cbo_baud.pack(side=tk.LEFT, padx=(0, 10))
+        self.cbo_baud.bind("<<ComboboxSelected>>", lambda e: self.apply_serial_settings())
 
-        # Simulation Mode Checkbox
-        self.var_sim = tk.BooleanVar(value=self.reader_thread.simulation_mode)
-        self.chk_sim = tk.Checkbutton(
-            self.control_frame,
-            text="Simulation Mode",
-            variable=self.var_sim,
-            font=("Segoe UI", 9, "bold"),
-            command=self.on_sim_toggle
-        )
-        self.chk_sim.pack(side=tk.LEFT, padx=10)
+        # Slave ID Selector
+        tk.Label(self.control_frame, text="Slave ID:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(5, 2))
+        self.cbo_slave = ttk.Combobox(self.control_frame, values=["1", "2", "3", "4", "5", "6", "7", "8"], width=4)
+        self.cbo_slave.set("1")
+        self.cbo_slave.pack(side=tk.LEFT, padx=(0, 10))
+        self.cbo_slave.bind("<<ComboboxSelected>>", lambda e: self.apply_serial_settings())
 
-        # Test Spike Button (For testing >105 dB alarm instantly)
-        self.btn_spike = tk.Button(
+        # Discord Alerts Button
+        self.btn_discord = tk.Button(
             self.control_frame,
-            text="⚡ Test >105dB Spike",
+            text="💬 Discord Alerts",
             font=("Segoe UI", 9, "bold"),
-            bg="#d9534f",
+            bg="#5865F2",
             fg="#ffffff",
-            activebackground="#c9302c",
+            activebackground="#4752C4",
             activeforeground="#ffffff",
-            command=self.trigger_alarm_test
+            command=self.open_discord_settings_dialog
         )
-        self.btn_spike.pack(side=tk.LEFT, padx=10)
+        self.btn_discord.pack(side=tk.LEFT, padx=5)
 
         # Theme Selector
-        tk.Label(self.control_frame, text="Theme:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(15, 2))
+        tk.Label(self.control_frame, text="Theme:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(10, 2))
         self.cbo_theme = ttk.Combobox(self.control_frame, values=list(THEMES.keys()), width=12, state="readonly")
         self.cbo_theme.set(self.theme_name)
         self.cbo_theme.pack(side=tk.LEFT, padx=(0, 5))
@@ -504,54 +533,91 @@ class SoundMeterApp:
         )
         self.btn_apply.pack(side=tk.RIGHT, padx=5)
 
-    def trigger_alarm_test(self):
-        """Forces simulation spike to test >105 dB alarm flashing."""
-        self.var_sim.set(True)
-        self.on_sim_toggle()
-        self.reader_thread.trigger_sim_spike()
+    def open_discord_settings_dialog(self):
+        """Opens popup window to configure Discord Webhook alerts."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Discord Webhook Alerts Setup")
+        dlg.geometry("540x360")
+        dlg.resizable(False, False)
+        dlg.grab_set()  # Modal window
 
-    def on_sim_toggle(self):
-        is_sim = self.var_sim.get()
+        tk.Label(dlg, text="💬 Discord Webhook Alerts Configuration", font=("Segoe UI", 12, "bold")).pack(pady=(15, 5))
 
-        if not HAS_SERIAL and not is_sim:
-            messagebox.showwarning(
-                "pyserial Missing",
-                "The 'pyserial' package is not installed in the active Python environment.\n\n"
-                "Please run: pip install pyserial\n"
-                "Or run using the Python environment where pyserial was installed."
-            )
-            self.var_sim.set(True)
-            return
+        f = tk.Frame(dlg, padx=20, pady=10)
+        f.pack(fill=tk.BOTH, expand=True)
 
-        port = self.cbo_port.get().strip()
-        baud = int(self.cbo_baud.get()) if self.cbo_baud.get().isdigit() else 9600
+        var_disc_enable = tk.BooleanVar(value=self.discord_enabled)
+        chk = tk.Checkbutton(f, text="Enable Discord Notifications when Level > 105 dB", variable=var_disc_enable, font=("Segoe UI", 10, "bold"))
+        chk.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
-        self.lbl_mode_badge.config(
-            text="SIMULATION MODE" if is_sim else f"CONNECTING ({port})...",
-            bg="#337ab7" if is_sim else "#f0ad4e",
-            fg="#ffffff"
-        )
-        self.reader_thread.set_config(
-            port=port,
-            baudrate=baud,
-            simulation_mode=is_sim
-        )
+        tk.Label(f, text="Webhook URL:", font=("Segoe UI", 9, "bold")).grid(row=1, column=0, sticky="w", pady=5)
+        ent_url = ttk.Entry(f, width=42)
+        ent_url.insert(0, self.discord_webhook_url)
+        ent_url.grid(row=1, column=1, sticky="w", pady=5)
+
+        tk.Label(f, text="User ID to Ping (Optional):", font=("Segoe UI", 9, "bold")).grid(row=2, column=0, sticky="w", pady=5)
+        ent_uid = ttk.Entry(f, width=22)
+        ent_uid.insert(0, self.discord_user_id)
+        ent_uid.grid(row=2, column=1, sticky="w", pady=5)
+        tk.Label(f, text="(Right-click Discord profile -> Copy User ID)", font=("Segoe UI", 8), fg="#777777").grid(row=3, column=1, sticky="w", pady=(0, 5))
+
+        tk.Label(f, text="Cooldown (Seconds):", font=("Segoe UI", 9, "bold")).grid(row=4, column=0, sticky="w", pady=5)
+        ent_cool = ttk.Entry(f, width=10)
+        ent_cool.insert(0, str(self.discord_cooldown))
+        ent_cool.grid(row=4, column=1, sticky="w", pady=5)
+
+        lbl_status = tk.Label(dlg, text="", font=("Segoe UI", 9, "bold"), fg="#5cb85c")
+        lbl_status.pack(pady=2)
+
+        def test_webhook():
+            url = ent_url.get().strip()
+            uid = ent_uid.get().strip()
+            if not url:
+                messagebox.showerror("Error", "Please enter a valid Discord Webhook URL first!")
+                return
+            lbl_status.config(text="Sending test alert to Discord...", fg="#f0ad4e")
+            dlg.update()
+
+            def run_test():
+                ok, res = send_discord_webhook(url, db_value=106.5, threshold=self.alarm_threshold, user_id=uid, is_test=True)
+                if ok:
+                    lbl_status.config(text="✅ Test notification sent successfully to Discord!", fg="#5cb85c")
+                else:
+                    lbl_status.config(text=f"❌ Failed: {res}", fg="#d9534f")
+
+            threading.Thread(target=run_test, daemon=True).start()
+
+        def save_and_close():
+            self.discord_enabled = var_disc_enable.get()
+            self.discord_webhook_url = ent_url.get().strip()
+            self.discord_user_id = ent_uid.get().strip()
+            try:
+                self.discord_cooldown = max(5, int(ent_cool.get().strip()))
+            except ValueError:
+                self.discord_cooldown = 60
+            dlg.destroy()
+
+        btn_box = tk.Frame(dlg, pady=10)
+        btn_box.pack(fill=tk.X, padx=20)
+
+        tk.Button(btn_box, text="🧪 Send Test Alert", font=("Segoe UI", 9, "bold"), command=test_webhook).pack(side=tk.LEFT, padx=10)
+        tk.Button(btn_box, text="Save & Close", font=("Segoe UI", 9, "bold"), bg="#5cb85c", fg="#ffffff", command=save_and_close).pack(side=tk.RIGHT, padx=10)
 
     def apply_serial_settings(self):
         port = self.cbo_port.get().strip()
         try:
             baud = int(self.cbo_baud.get())
+            slave = int(self.cbo_slave.get())
         except ValueError:
-            messagebox.showerror("Error", "Invalid Baud Rate!")
+            messagebox.showerror("Error", "Invalid Baud Rate or Slave ID!")
             return
-        is_sim = self.var_sim.get()
 
         self.lbl_mode_badge.config(
-            text="SIMULATION MODE" if is_sim else f"CONNECTING ({port})...",
-            bg="#337ab7" if is_sim else "#f0ad4e",
+            text=f"CONNECTING ({port})...",
+            bg="#f0ad4e",
             fg="#ffffff"
         )
-        self.reader_thread.set_config(port=port, baudrate=baud, simulation_mode=is_sim)
+        self.reader_thread.set_config(port=port, baudrate=baud, slave_addr=slave)
 
     def on_theme_change(self, event=None):
         self.theme_name = self.cbo_theme.get()
@@ -885,28 +951,35 @@ class SoundMeterApp:
                         if not self.alarm_active:
                             self.alarm_active = True
                             self.lbl_alarm_badge.config(bg="#FF0000", fg="#FFFFFF", text="🚨 ALARM: >105 dB!")
+
+                        # Trigger Discord Webhook Notification if enabled and cooldown passed
+                        if self.discord_enabled and self.discord_webhook_url:
+                            now = time.time()
+                            if now - self.last_discord_alert_time >= self.discord_cooldown:
+                                self.last_discord_alert_time = now
+                                url = self.discord_webhook_url
+                                uid = self.discord_user_id
+                                thresh = self.alarm_threshold
+                                threading.Thread(
+                                    target=send_discord_webhook,
+                                    args=(url, val, thresh, uid, False),
+                                    daemon=True
+                                ).start()
                     else:
                         if self.alarm_active:
                             self.alarm_active = False
                             self.lbl_alarm_badge.config(bg="#222222", fg="#888888", text="ALARM: >105 dB")
 
                     # Mode & Status Badges
-                    if mode == 'SIMULATION':
-                        if not self.reader_thread.simulation_mode:
-                            continue
-                        self.lbl_mode_badge.config(text="SIMULATION MODE", bg="#337ab7", fg="#ffffff")
-                        self.lbl_comm_led.config(text="● SIMULATING", fg="#00FF66")
-                    else:
-                        self.lbl_mode_badge.config(text=f"HARDWARE ({port})", bg="#5cb85c", fg="#ffffff")
-                        self.lbl_comm_led.config(text=f"● ONLINE ({port})", fg="#00E5FF")
-
+                    self.lbl_mode_badge.config(text=f"HARDWARE ({port})", bg="#5cb85c", fg="#ffffff")
+                    self.lbl_comm_led.config(text=f"● ONLINE ({port})", fg="#00FF66")
                     self.redraw_lcd()
 
                 elif msg['status'] in ('ERROR', 'TIMEOUT'):
                     err_msg = msg.get('error', 'Serial Timeout')
-                    self.lbl_mode_badge.config(text=f"SERIAL TIMEOUT ({port})", bg="#d9534f", fg="#ffffff")
-                    self.lbl_comm_led.config(text=f"● NO RESPONSE", fg="#FF3333")
-                    self.stat_labels['val_cur'].config(text="NO DATA")
+                    self.lbl_mode_badge.config(text=f"CONNECTING ({port})...", bg="#f0ad4e", fg="#ffffff")
+                    self.lbl_comm_led.config(text=f"● NO RESPONSE ({port})", fg="#FF3333")
+                    self.stat_labels['val_cur'].config(text="0.0 dB")
                     self.current_db = 0.0
                     self.redraw_lcd()
 
