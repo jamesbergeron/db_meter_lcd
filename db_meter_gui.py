@@ -291,7 +291,7 @@ class SoundMeterApp:
         self.root.geometry("920x680")
         self.root.minsize(750, 550)
 
-        # Application state
+        # Application state defaults
         self.theme_name = 'Matrix Green'
         self.alarm_threshold = 105.0
         self.alarm_active = False
@@ -305,21 +305,23 @@ class SoundMeterApp:
         self.peak_hold_db = 30.0
         self.peak_hold_timer = 0
 
-        # Discord Webhook State
+        # Discord Webhook State defaults
         self.discord_enabled = False
         self.discord_webhook_url = ""
         self.discord_user_id = ""
         self.discord_cooldown = 60  # seconds
         self.last_discord_alert_time = 0.0
 
+        # Load persistent configuration from config.json
+        self.load_config()
+
         # Queue & Thread
         self.data_queue = queue.Queue()
-        default_port = self.detect_default_port()
         self.reader_thread = ModbusReaderThread(
             data_queue=self.data_queue,
-            port=default_port,
-            baudrate=9600,
-            slave_addr=1
+            port=self.saved_port,
+            baudrate=self.saved_baud,
+            slave_addr=self.saved_slave
         )
 
         self.setup_ui()
@@ -329,6 +331,50 @@ class SoundMeterApp:
         self.reader_thread.start()
         self.root.after(50, self.process_queue)
         self.root.after(200, self.update_flash_cycle)
+
+    def load_config(self):
+        """Loads persistent application configuration from config.json."""
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                self.saved_port = cfg.get("port", "COM6" if sys.platform.startswith('win') else "/dev/ttyACM0")
+                self.saved_baud = int(cfg.get("baudrate", 9600))
+                self.saved_slave = int(cfg.get("slave_addr", 1))
+                self.theme_name = cfg.get("theme", "Matrix Green")
+                self.alarm_threshold = float(cfg.get("alarm_threshold", 105.0))
+                self.discord_enabled = bool(cfg.get("discord_enabled", False))
+                self.discord_webhook_url = str(cfg.get("discord_webhook_url", ""))
+                self.discord_user_id = str(cfg.get("discord_user_id", ""))
+                self.discord_cooldown = int(cfg.get("discord_cooldown", 60))
+                return
+            except Exception as e:
+                print(f"Error loading config.json: {e}")
+
+        self.saved_port = "COM6" if sys.platform.startswith('win') else "/dev/ttyACM0"
+        self.saved_baud = 9600
+        self.saved_slave = 1
+
+    def save_config(self):
+        """Saves persistent application configuration to config.json."""
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        cfg = {
+            "port": getattr(self, "cbo_port", None) and self.cbo_port.get().strip() or getattr(self, "saved_port", "COM6"),
+            "baudrate": getattr(self, "cbo_baud", None) and int(self.cbo_baud.get()) or getattr(self, "saved_baud", 9600),
+            "slave_addr": getattr(self, "cbo_slave", None) and int(self.cbo_slave.get()) or getattr(self, "saved_slave", 1),
+            "theme": self.theme_name,
+            "alarm_threshold": self.alarm_threshold,
+            "discord_enabled": self.discord_enabled,
+            "discord_webhook_url": self.discord_webhook_url,
+            "discord_user_id": self.discord_user_id,
+            "discord_cooldown": self.discord_cooldown
+        }
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=4)
+        except Exception as e:
+            print(f"Error saving config.json: {e}")
 
     def detect_default_port(self):
         """Finds default serial port for Windows or Linux."""
@@ -486,21 +532,21 @@ class SoundMeterApp:
         # Serial Port Selector
         tk.Label(self.control_frame, text="Port:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(5, 2))
         self.cbo_port = ttk.Combobox(self.control_frame, values=self.get_port_list(), width=13, postcommand=self.refresh_port_list)
-        self.cbo_port.set("COM6" if sys.platform.startswith('win') else "/dev/ttyACM0")
+        self.cbo_port.set(self.saved_port)
         self.cbo_port.pack(side=tk.LEFT, padx=(0, 10))
         self.cbo_port.bind("<<ComboboxSelected>>", lambda e: self.apply_serial_settings())
 
         # Baud Rate Selector
         tk.Label(self.control_frame, text="Baud:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(5, 2))
         self.cbo_baud = ttk.Combobox(self.control_frame, values=["2400", "4800", "9600", "19200", "38400", "115200"], width=7)
-        self.cbo_baud.set("9600")
+        self.cbo_baud.set(str(self.saved_baud))
         self.cbo_baud.pack(side=tk.LEFT, padx=(0, 10))
         self.cbo_baud.bind("<<ComboboxSelected>>", lambda e: self.apply_serial_settings())
 
         # Slave ID Selector
         tk.Label(self.control_frame, text="Slave ID:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(5, 2))
         self.cbo_slave = ttk.Combobox(self.control_frame, values=["1", "2", "3", "4", "5", "6", "7", "8"], width=4)
-        self.cbo_slave.set("1")
+        self.cbo_slave.set(str(self.saved_slave))
         self.cbo_slave.pack(side=tk.LEFT, padx=(0, 10))
         self.cbo_slave.bind("<<ComboboxSelected>>", lambda e: self.apply_serial_settings())
 
@@ -595,6 +641,7 @@ class SoundMeterApp:
                 self.discord_cooldown = max(5, int(ent_cool.get().strip()))
             except ValueError:
                 self.discord_cooldown = 60
+            self.save_config()
             dlg.destroy()
 
         btn_box = tk.Frame(dlg, pady=10)
@@ -618,10 +665,12 @@ class SoundMeterApp:
             fg="#ffffff"
         )
         self.reader_thread.set_config(port=port, baudrate=baud, slave_addr=slave)
+        self.save_config()
 
     def on_theme_change(self, event=None):
         self.theme_name = self.cbo_theme.get()
         self.apply_theme()
+        self.save_config()
         self.redraw_lcd()
 
     def apply_theme(self):
