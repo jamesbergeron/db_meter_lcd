@@ -2,7 +2,7 @@
 """
 Graphical LCD 7-Segment dB Sound Level Meter
 Cross-Platform (Windows / Linux) GUI for Modbus RTU Noise Sensor
-Features: Vector 7-segment display, Flashing Red Alarm (>105 dB), Bar Meter, Peak Hold, Statistics, Simulation Mode
+Features: Vector 7-segment display, Flashing Red Alarm (>105 dB), Bar Meter, Peak Hold, Statistics, Piecewise Linear Calibration Curve
 """
 
 import sys
@@ -312,6 +312,11 @@ class SoundMeterApp:
         self.discord_cooldown = 60  # seconds
         self.last_discord_alert_time = 0.0
 
+        # Calibration Curve defaults
+        # List of [raw_db, corrected_db] pairs, sorted by raw_db
+        self.calibration_points = []
+        self.calibration_enabled = False
+
         # Load persistent configuration from config.json
         self.load_config()
 
@@ -348,6 +353,9 @@ class SoundMeterApp:
                 self.discord_webhook_url = str(cfg.get("discord_webhook_url", ""))
                 self.discord_user_id = str(cfg.get("discord_user_id", ""))
                 self.discord_cooldown = int(cfg.get("discord_cooldown", 60))
+                raw_pts = cfg.get("calibration_points", [])
+                self.calibration_points = [[float(p[0]), float(p[1])] for p in raw_pts if len(p) == 2]
+                self.calibration_enabled = bool(cfg.get("calibration_enabled", False))
                 return
             except Exception as e:
                 print(f"Error loading config.json: {e}")
@@ -368,13 +376,52 @@ class SoundMeterApp:
             "discord_enabled": self.discord_enabled,
             "discord_webhook_url": self.discord_webhook_url,
             "discord_user_id": self.discord_user_id,
-            "discord_cooldown": self.discord_cooldown
+            "discord_cooldown": self.discord_cooldown,
+            "calibration_points": self.calibration_points,
+            "calibration_enabled": self.calibration_enabled
         }
         try:
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=4)
         except Exception as e:
             print(f"Error saving config.json: {e}")
+
+    # ==========================================
+    # Calibration Curve Engine
+    # ==========================================
+    def apply_calibration(self, raw_db: float) -> float:
+        """
+        Applies piecewise linear interpolation using the user-defined
+        calibration curve (list of [raw, corrected] points).
+        Points outside the range are extrapolated from the nearest segment.
+        """
+        pts = sorted(self.calibration_points, key=lambda p: p[0])
+        if len(pts) < 2:
+            return raw_db  # Not enough points — pass through unchanged
+
+        # Below the lowest calibration point: extrapolate from first segment
+        if raw_db <= pts[0][0]:
+            x0, y0 = pts[0]
+            x1, y1 = pts[1]
+            slope = (y1 - y0) / (x1 - x0) if x1 != x0 else 1.0
+            return y0 + slope * (raw_db - x0)
+
+        # Above the highest calibration point: extrapolate from last segment
+        if raw_db >= pts[-1][0]:
+            x0, y0 = pts[-2]
+            x1, y1 = pts[-1]
+            slope = (y1 - y0) / (x1 - x0) if x1 != x0 else 1.0
+            return y1 + slope * (raw_db - x1)
+
+        # Interpolate between bracketing points
+        for i in range(len(pts) - 1):
+            x0, y0 = pts[i]
+            x1, y1 = pts[i + 1]
+            if x0 <= raw_db <= x1:
+                t = (raw_db - x0) / (x1 - x0) if x1 != x0 else 0.0
+                return y0 + t * (y1 - y0)
+
+        return raw_db  # Fallback — should not reach here
 
     def detect_default_port(self):
         """Finds default serial port for Windows or Linux."""
@@ -563,6 +610,19 @@ class SoundMeterApp:
         )
         self.btn_discord.pack(side=tk.LEFT, padx=5)
 
+        # Calibration Curve Button
+        self.btn_cal = tk.Button(
+            self.control_frame,
+            text="📐 Calibration",
+            font=("Segoe UI", 9, "bold"),
+            bg="#e67e22",
+            fg="#ffffff",
+            activebackground="#ca6f1e",
+            activeforeground="#ffffff",
+            command=self.open_calibration_dialog
+        )
+        self.btn_cal.pack(side=tk.LEFT, padx=5)
+
         # Theme Selector
         tk.Label(self.control_frame, text="Theme:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(10, 2))
         self.cbo_theme = ttk.Combobox(self.control_frame, values=list(THEMES.keys()), width=12, state="readonly")
@@ -650,6 +710,176 @@ class SoundMeterApp:
         tk.Button(btn_box, text="🧪 Send Test Alert", font=("Segoe UI", 9, "bold"), command=test_webhook).pack(side=tk.LEFT, padx=10)
         tk.Button(btn_box, text="Save & Close", font=("Segoe UI", 9, "bold"), bg="#5cb85c", fg="#ffffff", command=save_and_close).pack(side=tk.RIGHT, padx=10)
 
+    def open_calibration_dialog(self):
+        """Opens a calibration curve editor dialog."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("📐 Sensor Calibration Curve")
+        dlg.geometry("620x560")
+        dlg.resizable(True, True)
+        dlg.grab_set()
+
+        tk.Label(
+            dlg,
+            text="📐 Piecewise Linear Calibration Curve",
+            font=("Segoe UI", 13, "bold")
+        ).pack(pady=(14, 2))
+
+        tk.Label(
+            dlg,
+            text="Enter pairs of (Raw Sensor Reading) → (Calibrated Reference Reading) from your reference meter.",
+            font=("Segoe UI", 9),
+            fg="#555555",
+            wraplength=580
+        ).pack(pady=(0, 8))
+
+        tk.Label(
+            dlg,
+            text="The curve interpolates linearly between points and extrapolates at the edges.",
+            font=("Segoe UI", 9, "italic"),
+            fg="#777777"
+        ).pack(pady=(0, 8))
+
+        # Column headers
+        hdr = tk.Frame(dlg, padx=20)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text="Raw Reading (dB)", font=("Segoe UI", 9, "bold"), width=18, anchor="w").pack(side=tk.LEFT)
+        tk.Label(hdr, text="Calibrated Reference (dB)", font=("Segoe UI", 9, "bold"), width=22, anchor="w").pack(side=tk.LEFT)
+
+        # Scrollable list frame
+        list_outer = tk.Frame(dlg, bd=1, relief=tk.SUNKEN)
+        list_outer.pack(fill=tk.BOTH, expand=True, padx=20, pady=4)
+
+        canvas_scroll = tk.Canvas(list_outer, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(list_outer, orient="vertical", command=canvas_scroll.yview)
+        canvas_scroll.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas_scroll.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        inner_frame = tk.Frame(canvas_scroll)
+        inner_window = canvas_scroll.create_window((0, 0), window=inner_frame, anchor="nw")
+
+        def on_frame_configure(e):
+            canvas_scroll.configure(scrollregion=canvas_scroll.bbox("all"))
+        inner_frame.bind("<Configure>", on_frame_configure)
+
+        def on_canvas_configure(e):
+            canvas_scroll.itemconfig(inner_window, width=e.width)
+        canvas_scroll.bind("<Configure>", on_canvas_configure)
+
+        # Row entries list [(raw_var, cal_var, row_frame), ...]
+        rows = []
+
+        def add_row(raw_val="", cal_val=""):
+            row_f = tk.Frame(inner_frame, pady=2)
+            row_f.pack(fill=tk.X, padx=6)
+
+            raw_var = tk.StringVar(value=str(raw_val))
+            cal_var = tk.StringVar(value=str(cal_val))
+
+            ent_raw = ttk.Entry(row_f, textvariable=raw_var, width=16)
+            ent_raw.pack(side=tk.LEFT, padx=(0, 12))
+
+            tk.Label(row_f, text="→", font=("Segoe UI", 11)).pack(side=tk.LEFT, padx=(0, 8))
+
+            ent_cal = ttk.Entry(row_f, textvariable=cal_var, width=16)
+            ent_cal.pack(side=tk.LEFT, padx=(0, 12))
+
+            def remove_this_row(rf=row_f, r=(None,)):
+                for i, (rv, cv, rf2) in enumerate(rows):
+                    if rf2 is rf:
+                        rows.pop(i)
+                        rf.destroy()
+                        break
+
+            tk.Button(
+                row_f, text="✕", font=("Segoe UI", 8), fg="#cc0000",
+                relief=tk.FLAT, padx=4, command=remove_this_row
+            ).pack(side=tk.LEFT)
+
+            rows.append((raw_var, cal_var, row_f))
+            canvas_scroll.update_idletasks()
+            canvas_scroll.yview_moveto(1.0)
+
+        # Pre-populate with existing calibration points
+        existing = sorted(self.calibration_points, key=lambda p: p[0])
+        for pt in existing:
+            add_row(f"{pt[0]:.1f}", f"{pt[1]:.1f}")
+
+        # If no points yet, seed with a blank row
+        if not existing:
+            add_row()
+
+        # Enable toggle
+        var_enabled = tk.BooleanVar(value=self.calibration_enabled)
+
+        # Bottom controls
+        bottom = tk.Frame(dlg, padx=20, pady=8)
+        bottom.pack(fill=tk.X, side=tk.BOTTOM)
+
+        status_lbl = tk.Label(dlg, text="", font=("Segoe UI", 9, "bold"), fg="#c0392b")
+        status_lbl.pack(side=tk.BOTTOM, pady=(0, 2))
+
+        chk_enable = tk.Checkbutton(
+            bottom,
+            text="Apply calibration correction to all readings",
+            variable=var_enabled,
+            font=("Segoe UI", 9, "bold")
+        )
+        chk_enable.pack(side=tk.LEFT)
+
+        def add_blank_row():
+            add_row()
+
+        def save_and_close():
+            pts = []
+            for raw_var, cal_var, _ in rows:
+                raw_s = raw_var.get().strip()
+                cal_s = cal_var.get().strip()
+                if not raw_s and not cal_s:
+                    continue  # skip blank rows
+                try:
+                    raw_f = float(raw_s)
+                    cal_f = float(cal_s)
+                    pts.append([raw_f, cal_f])
+                except ValueError:
+                    status_lbl.config(text=f"⚠ Invalid value — all entries must be numbers (e.g. 67.5)")
+                    return
+
+            # Check for duplicate raw values
+            raw_vals = [p[0] for p in pts]
+            if len(raw_vals) != len(set(raw_vals)):
+                status_lbl.config(text="⚠ Duplicate raw dB values detected — each raw reading must be unique.")
+                return
+
+            pts.sort(key=lambda p: p[0])
+            self.calibration_points = pts
+            self.calibration_enabled = var_enabled.get()
+            self.save_config()
+            self._update_cal_badge()
+            dlg.destroy()
+
+        btn_row = tk.Frame(bottom)
+        btn_row.pack(side=tk.RIGHT)
+
+        tk.Button(
+            btn_row, text="+ Add Point",
+            font=("Segoe UI", 9, "bold"),
+            command=add_blank_row
+        ).pack(side=tk.LEFT, padx=6)
+
+        tk.Button(
+            btn_row, text="Save & Apply",
+            font=("Segoe UI", 9, "bold"),
+            bg="#27ae60", fg="#ffffff",
+            command=save_and_close
+        ).pack(side=tk.LEFT, padx=6)
+
+        tk.Button(
+            btn_row, text="Cancel",
+            font=("Segoe UI", 9, "bold"),
+            command=dlg.destroy
+        ).pack(side=tk.LEFT, padx=6)
+
     def apply_serial_settings(self):
         port = self.cbo_port.get().strip()
         try:
@@ -696,6 +926,17 @@ class SoundMeterApp:
         for widget in self.control_frame.winfo_children():
             if isinstance(widget, (tk.Label, tk.Checkbutton)):
                 widget.config(bg=bg, fg=text_color)
+
+        self._update_cal_badge()
+
+    def _update_cal_badge(self):
+        """Updates the Calibration button to indicate active/inactive state."""
+        if not hasattr(self, 'btn_cal'):
+            return
+        if self.calibration_enabled and len(self.calibration_points) >= 2:
+            self.btn_cal.config(text="📐 CAL ACTIVE", bg="#27ae60", activebackground="#1e8449")
+        else:
+            self.btn_cal.config(text="📐 Calibration", bg="#e67e22", activebackground="#ca6f1e")
 
     def reset_statistics(self):
         self.min_db = 999.9
@@ -881,6 +1122,19 @@ class SoundMeterApp:
             anchor="w"
         )
 
+        # Draw CAL indicator badge when calibration is active
+        if self.calibration_enabled and len(self.calibration_points) >= 2:
+            cal_font_size = max(8, int(digit_height * 0.13))
+            cal_badge_x = unit_x
+            cal_badge_y = unit_y + digit_height * 0.28
+            self.canvas.create_text(
+                cal_badge_x, cal_badge_y,
+                text="CAL",
+                font=("Segoe UI", cal_font_size, "bold"),
+                fill="#27ae60",
+                anchor="w"
+            )
+
         # ----------------------------------
         # 2. Render Bottom Bar Graph & Peak Hold
         # ----------------------------------
@@ -977,7 +1231,12 @@ class SoundMeterApp:
                 port = msg.get('port', self.cbo_port.get().strip())
 
                 if msg['status'] == 'OK':
-                    val = msg['db']
+                    raw_val = msg['db']
+                    # Apply piecewise linear calibration if enabled
+                    if self.calibration_enabled and len(self.calibration_points) >= 2:
+                        val = self.apply_calibration(raw_val)
+                    else:
+                        val = raw_val
                     self.current_db = val
 
                     # Update statistics
