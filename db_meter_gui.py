@@ -2,7 +2,8 @@
 """
 Graphical LCD 7-Segment dB Sound Level Meter
 Cross-Platform (Windows / Linux) GUI for Modbus RTU Noise Sensor
-Features: Vector 7-segment display, Flashing Red Alarm (>105 dB), Bar Meter, Peak Hold, Statistics, Piecewise Linear Calibration Curve
+Features: Vector 7-segment display, Flashing Red Alarm (>105 dB), Bar Meter, Peak Hold, Statistics,
+         Piecewise Linear Calibration Curve, Network UDP/TCP Source (Raspberry Pi sender support)
 """
 
 import sys
@@ -11,6 +12,7 @@ import time
 import math
 import random
 import json
+import socket
 import urllib.request
 import urllib.parse
 import threading
@@ -19,7 +21,7 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-# Try importing pyserial; if missing or on error, serial operations switch to simulation
+# Try importing pyserial; if missing, serial operations are unavailable
 try:
     import serial
     import serial.tools.list_ports
@@ -227,6 +229,188 @@ class ModbusReaderThread(threading.Thread):
 
 
 # ==========================================
+# UDP Broadcast Listener Thread
+# ==========================================
+class UDPListenerThread(threading.Thread):
+    """
+    Listens for UDP broadcast packets sent by db_meter_sender.py.
+    Parses JSON payloads and puts messages onto the shared data_queue
+    in the same format as ModbusReaderThread.
+    """
+    def __init__(self, data_queue, udp_port=55123, sender_filter=""):
+        super().__init__(daemon=True, name="UDPListener")
+        self.data_queue = data_queue
+        self.udp_port = udp_port
+        self.sender_filter = sender_filter.strip()
+        self.running = True
+        self._sock = None
+
+    def stop(self):
+        self.running = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+
+    def run(self):
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.settimeout(1.0)
+            self._sock.bind(("0.0.0.0", self.udp_port))
+        except OSError as e:
+            self.data_queue.put({
+                'status': 'ERROR',
+                'db': 0.0,
+                'error': f'UDP bind failed on port {self.udp_port}: {e}',
+                'port': f'UDP:{self.udp_port}',
+                'source': 'udp',
+                'timestamp': datetime.now().strftime("%H:%M:%S")
+            })
+            return
+
+        while self.running:
+            try:
+                data, addr = self._sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            try:
+                payload = json.loads(data.decode("utf-8").strip())
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+
+            # Optional sender filter by IP or sender name
+            if self.sender_filter:
+                sender_name = payload.get("sender", "")
+                if self.sender_filter not in addr[0] and self.sender_filter != sender_name:
+                    continue
+
+            status = payload.get("status", "OK")
+            db_val = float(payload.get("db", 0.0))
+            sender_id = f"{addr[0]} ({payload.get('sender', 'unknown')})"
+
+            self.data_queue.put({
+                'status': status,
+                'db': db_val,
+                'error': payload.get("error", ""),
+                'port': sender_id,
+                'source': 'udp',
+                'timestamp': payload.get("timestamp", datetime.now().strftime("%H:%M:%S"))
+            })
+
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+
+
+# ==========================================
+# TCP Client Thread (connects to Pi sender)
+# ==========================================
+class TCPClientThread(threading.Thread):
+    """
+    Connects to a db_meter_sender.py TCP server running on the Raspberry Pi.
+    Reads newline-delimited JSON and puts messages onto data_queue.
+    Automatically reconnects on disconnect with backoff.
+    """
+    def __init__(self, data_queue, host, tcp_port=55124):
+        super().__init__(daemon=True, name="TCPClient")
+        self.data_queue = data_queue
+        self.host = host
+        self.tcp_port = tcp_port
+        self.running = True
+        self._sock = None
+
+    def stop(self):
+        self.running = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+
+    def run(self):
+        backoff = 1.0
+        while self.running:
+            try:
+                self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._sock.settimeout(5.0)
+                self._sock.connect((self.host, self.tcp_port))
+                self._sock.settimeout(2.0)
+                backoff = 1.0  # reset on successful connect
+
+                self.data_queue.put({
+                    'status': 'OK',
+                    'db': 0.0,
+                    'port': f'{self.host}:{self.tcp_port}',
+                    'source': 'tcp',
+                    'timestamp': datetime.now().strftime("%H:%M:%S")
+                })
+
+                buf = b""
+                while self.running:
+                    try:
+                        chunk = self._sock.recv(4096)
+                    except socket.timeout:
+                        continue
+                    except (OSError, ConnectionResetError):
+                        break
+
+                    if not chunk:
+                        break
+
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        try:
+                            payload = json.loads(line.decode("utf-8").strip())
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            continue
+
+                        status = payload.get("status", "OK")
+                        db_val = float(payload.get("db", 0.0))
+                        sender_id = f"{self.host}:{self.tcp_port}"
+
+                        self.data_queue.put({
+                            'status': status,
+                            'db': db_val,
+                            'error': payload.get("error", ""),
+                            'port': sender_id,
+                            'source': 'tcp',
+                            'timestamp': payload.get("timestamp", datetime.now().strftime("%H:%M:%S"))
+                        })
+
+            except (OSError, ConnectionRefusedError, socket.timeout) as e:
+                self.data_queue.put({
+                    'status': 'ERROR',
+                    'db': 0.0,
+                    'error': f'TCP: Cannot connect to {self.host}:{self.tcp_port} — {e}',
+                    'port': f'{self.host}:{self.tcp_port}',
+                    'source': 'tcp',
+                    'timestamp': datetime.now().strftime("%H:%M:%S")
+                })
+            finally:
+                if self._sock:
+                    try:
+                        self._sock.close()
+                    except Exception:
+                        pass
+                    self._sock = None
+
+            # Wait before reconnecting
+            for _ in range(int(backoff * 10)):
+                if not self.running:
+                    break
+                time.sleep(0.1)
+            backoff = min(backoff * 2, 15.0)  # cap at 15s
+
+
+# ==========================================
 # Color Themes Configuration
 # ==========================================
 THEMES = {
@@ -317,6 +501,14 @@ class SoundMeterApp:
         self.calibration_points = []
         self.calibration_enabled = False
 
+        # Network source defaults
+        self.source_mode = 'serial'   # 'serial' | 'udp' | 'tcp'
+        self.udp_listen_port = 55123
+        self.tcp_host = ''
+        self.tcp_remote_port = 55124
+        self.net_sender_filter = ''
+        self._net_thread = None       # Active network thread (UDPListenerThread or TCPClientThread)
+
         # Load persistent configuration from config.json
         self.load_config()
 
@@ -332,8 +524,13 @@ class SoundMeterApp:
         self.setup_ui()
         self.apply_theme()
 
-        # Start background thread and update timer loop
-        self.reader_thread.start()
+        # Start the appropriate source thread
+        if self.source_mode == 'serial':
+            self.reader_thread.start()
+        else:
+            self.reader_thread.start()   # Start in background (paused at serial open)
+            self.set_source_mode(self.source_mode, startup=True)
+
         self.root.after(50, self.process_queue)
         self.root.after(200, self.update_flash_cycle)
 
@@ -356,6 +553,11 @@ class SoundMeterApp:
                 raw_pts = cfg.get("calibration_points", [])
                 self.calibration_points = [[float(p[0]), float(p[1])] for p in raw_pts if len(p) == 2]
                 self.calibration_enabled = bool(cfg.get("calibration_enabled", False))
+                self.source_mode = cfg.get("source_mode", "serial")
+                self.udp_listen_port = int(cfg.get("udp_listen_port", 55123))
+                self.tcp_host = str(cfg.get("tcp_host", ""))
+                self.tcp_remote_port = int(cfg.get("tcp_remote_port", 55124))
+                self.net_sender_filter = str(cfg.get("net_sender_filter", ""))
                 return
             except Exception as e:
                 print(f"Error loading config.json: {e}")
@@ -378,7 +580,12 @@ class SoundMeterApp:
             "discord_user_id": self.discord_user_id,
             "discord_cooldown": self.discord_cooldown,
             "calibration_points": self.calibration_points,
-            "calibration_enabled": self.calibration_enabled
+            "calibration_enabled": self.calibration_enabled,
+            "source_mode": self.source_mode,
+            "udp_listen_port": self.udp_listen_port,
+            "tcp_host": self.tcp_host,
+            "tcp_remote_port": self.tcp_remote_port,
+            "net_sender_filter": self.net_sender_filter,
         }
         try:
             with open(config_path, "w", encoding="utf-8") as f:
@@ -576,26 +783,102 @@ class SoundMeterApp:
         self.control_frame = tk.Frame(self.main_frame)
         self.control_frame.pack(fill=tk.X, padx=15, pady=5)
 
-        # Serial Port Selector
-        tk.Label(self.control_frame, text="Port:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(5, 2))
+        # --- Source Mode Radio Buttons ---
+        self._var_source = tk.StringVar(value=self.source_mode)
+        rb_serial = tk.Radiobutton(
+            self.control_frame, text="◉ COM Port",
+            variable=self._var_source, value="serial",
+            font=("Segoe UI", 9, "bold"),
+            command=self._on_source_radio_change
+        )
+        rb_serial.pack(side=tk.LEFT, padx=(5, 2))
+
+        rb_net = tk.Radiobutton(
+            self.control_frame, text="◎ Network",
+            variable=self._var_source, value="network",
+            font=("Segoe UI", 9, "bold"),
+            command=self._on_source_radio_change
+        )
+        rb_net.pack(side=tk.LEFT, padx=(0, 10))
+
+        # Separator
+        ttk.Separator(self.control_frame, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=3)
+
+        # --- Serial Controls Group (shown only in COM mode) ---
+        self._serial_widgets = []  # track for show/hide
+
+        lbl_port = tk.Label(self.control_frame, text="Port:", font=("Segoe UI", 9, "bold"))
+        lbl_port.pack(side=tk.LEFT, padx=(5, 2))
+        self._serial_widgets.append(lbl_port)
+
         self.cbo_port = ttk.Combobox(self.control_frame, values=self.get_port_list(), width=13, postcommand=self.refresh_port_list)
         self.cbo_port.set(self.saved_port)
         self.cbo_port.pack(side=tk.LEFT, padx=(0, 10))
         self.cbo_port.bind("<<ComboboxSelected>>", lambda e: self.apply_serial_settings())
+        self._serial_widgets.append(self.cbo_port)
 
-        # Baud Rate Selector
-        tk.Label(self.control_frame, text="Baud:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(5, 2))
+        lbl_baud = tk.Label(self.control_frame, text="Baud:", font=("Segoe UI", 9, "bold"))
+        lbl_baud.pack(side=tk.LEFT, padx=(5, 2))
+        self._serial_widgets.append(lbl_baud)
+
         self.cbo_baud = ttk.Combobox(self.control_frame, values=["2400", "4800", "9600", "19200", "38400", "115200"], width=7)
         self.cbo_baud.set(str(self.saved_baud))
         self.cbo_baud.pack(side=tk.LEFT, padx=(0, 10))
         self.cbo_baud.bind("<<ComboboxSelected>>", lambda e: self.apply_serial_settings())
+        self._serial_widgets.append(self.cbo_baud)
 
-        # Slave ID Selector
-        tk.Label(self.control_frame, text="Slave ID:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(5, 2))
+        lbl_slave = tk.Label(self.control_frame, text="Slave ID:", font=("Segoe UI", 9, "bold"))
+        lbl_slave.pack(side=tk.LEFT, padx=(5, 2))
+        self._serial_widgets.append(lbl_slave)
+
         self.cbo_slave = ttk.Combobox(self.control_frame, values=["1", "2", "3", "4", "5", "6", "7", "8"], width=4)
         self.cbo_slave.set(str(self.saved_slave))
         self.cbo_slave.pack(side=tk.LEFT, padx=(0, 10))
         self.cbo_slave.bind("<<ComboboxSelected>>", lambda e: self.apply_serial_settings())
+        self._serial_widgets.append(self.cbo_slave)
+
+        # Apply serial settings button
+        self.btn_apply = tk.Button(
+            self.control_frame,
+            text="Apply Serial",
+            font=("Segoe UI", 9, "bold"),
+            command=self.apply_serial_settings
+        )
+        self.btn_apply.pack(side=tk.LEFT, padx=5)
+        self._serial_widgets.append(self.btn_apply)
+
+        # --- Network Controls Group (shown only in Network mode) ---
+        self._net_widgets = []  # track for show/hide
+
+        self._lbl_net_mode = tk.Label(self.control_frame, text="Mode:", font=("Segoe UI", 9, "bold"))
+        self._lbl_net_mode.pack(side=tk.LEFT, padx=(5, 2))
+        self._net_widgets.append(self._lbl_net_mode)
+
+        self._cbo_net_mode = ttk.Combobox(
+            self.control_frame,
+            values=["UDP Broadcast", "TCP Direct"],
+            width=14,
+            state="readonly"
+        )
+        self._cbo_net_mode.set("TCP Direct" if self.source_mode == "tcp" else "UDP Broadcast")
+        self._cbo_net_mode.pack(side=tk.LEFT, padx=(0, 6))
+        self._net_widgets.append(self._cbo_net_mode)
+
+        self._btn_net_settings = tk.Button(
+            self.control_frame,
+            text="⚙ Network Settings",
+            font=("Segoe UI", 9, "bold"),
+            bg="#17a2b8",
+            fg="#ffffff",
+            activebackground="#138496",
+            activeforeground="#ffffff",
+            command=self.open_network_settings_dialog
+        )
+        self._btn_net_settings.pack(side=tk.LEFT, padx=5)
+        self._net_widgets.append(self._btn_net_settings)
+
+        # --- Shared Right-side Buttons ---
+        ttk.Separator(self.control_frame, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=3)
 
         # Discord Alerts Button
         self.btn_discord = tk.Button(
@@ -630,14 +913,211 @@ class SoundMeterApp:
         self.cbo_theme.pack(side=tk.LEFT, padx=(0, 5))
         self.cbo_theme.bind("<<ComboboxSelected>>", self.on_theme_change)
 
-        # Apply serial settings button
-        self.btn_apply = tk.Button(
-            self.control_frame,
-            text="Apply Serial",
-            font=("Segoe UI", 9, "bold"),
-            command=self.apply_serial_settings
-        )
-        self.btn_apply.pack(side=tk.RIGHT, padx=5)
+        # Apply the correct widget visibility for saved source mode
+        self._apply_source_widget_visibility()
+
+    def _on_source_radio_change(self):
+        """Called when user clicks COM Port or Network radio button."""
+        sel = self._var_source.get()
+        if sel == "network":
+            net_mode = self._cbo_net_mode.get()
+            mode = "tcp" if net_mode == "TCP Direct" else "udp"
+        else:
+            mode = "serial"
+        self.set_source_mode(mode)
+        self._apply_source_widget_visibility()
+
+    def _apply_source_widget_visibility(self):
+        """Shows/hides serial vs network controls based on current source mode."""
+        is_serial = (self.source_mode == 'serial')
+        for w in self._serial_widgets:
+            if is_serial:
+                w.pack_info()  # already packed, just ensure visible
+            else:
+                try:
+                    w.pack_forget()
+                except Exception:
+                    pass
+        for w in self._net_widgets:
+            if not is_serial:
+                pass  # already visible
+            else:
+                try:
+                    w.pack_forget()
+                except Exception:
+                    pass
+
+        # Re-pack in correct order based on mode
+        # We do a full re-pack of the variable section since pack ordering matters
+        # First remove all tracked widgets
+        for w in self._serial_widgets + self._net_widgets:
+            try:
+                w.pack_forget()
+            except Exception:
+                pass
+
+        if is_serial:
+            # Re-pack serial controls after the separtor
+            sep_index = 0
+            children = self.control_frame.pack_slaves()
+            # Pack serials in order
+            for w in self._serial_widgets:
+                w.pack(side=tk.LEFT, padx=w._pack_padx if hasattr(w, '_pack_padx') else 3)
+        else:
+            for w in self._net_widgets:
+                w.pack(side=tk.LEFT, padx=3)
+
+    def set_source_mode(self, mode: str, startup: bool = False):
+        """
+        Switches the active data source.
+        mode: 'serial' | 'udp' | 'tcp'
+        """
+        # Stop existing network thread
+        if self._net_thread and self._net_thread.is_alive():
+            self._net_thread.stop()
+            self._net_thread = None
+
+        # Drain queue
+        try:
+            while not self.data_queue.empty():
+                self.data_queue.get_nowait()
+        except Exception:
+            pass
+
+        self.source_mode = mode
+        self._var_source.set("serial" if mode == "serial" else "network")
+
+        if mode == 'serial':
+            # Serial thread is always running; just let it take over
+            self.lbl_mode_badge.config(text="CONNECTING...", bg="#f0ad4e", fg="#ffffff")
+
+        elif mode == 'udp':
+            self._net_thread = UDPListenerThread(
+                data_queue=self.data_queue,
+                udp_port=self.udp_listen_port,
+                sender_filter=self.net_sender_filter
+            )
+            self._net_thread.start()
+            self.lbl_mode_badge.config(
+                text=f"UDP :{self.udp_listen_port}",
+                bg="#17a2b8", fg="#ffffff"
+            )
+
+        elif mode == 'tcp':
+            if not self.tcp_host:
+                messagebox.showwarning(
+                    "TCP Host Required",
+                    "Please enter the Raspberry Pi IP address in Network Settings first."
+                )
+                self.source_mode = 'serial' if startup else self.source_mode
+                self._var_source.set("serial")
+                return
+            self._net_thread = TCPClientThread(
+                data_queue=self.data_queue,
+                host=self.tcp_host,
+                tcp_port=self.tcp_remote_port
+            )
+            self._net_thread.start()
+            self.lbl_mode_badge.config(
+                text=f"TCP {self.tcp_host}:{self.tcp_remote_port}",
+                bg="#17a2b8", fg="#ffffff"
+            )
+
+        self.save_config()
+
+    def open_network_settings_dialog(self):
+        """Opens network configuration dialog."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("⚙ Network Source Settings")
+        dlg.geometry("500x340")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="⚙ Network Source Configuration", font=("Segoe UI", 13, "bold")).pack(pady=(14, 4))
+        tk.Label(
+            dlg,
+            text="Configure how this application receives data from a remote db_meter_sender.py instance.",
+            font=("Segoe UI", 9), fg="#555555", wraplength=460
+        ).pack(pady=(0, 10))
+
+        f = tk.Frame(dlg, padx=28)
+        f.pack(fill=tk.BOTH, expand=True)
+
+        # Mode selector
+        tk.Label(f, text="Mode:", font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w", pady=6)
+        var_mode = tk.StringVar(value="TCP Direct" if self.source_mode == "tcp" else "UDP Broadcast")
+        cbo_mode = ttk.Combobox(f, textvariable=var_mode, values=["UDP Broadcast", "TCP Direct"],
+                                 state="readonly", width=18)
+        cbo_mode.grid(row=0, column=1, sticky="w", pady=6)
+
+        # UDP port
+        tk.Label(f, text="UDP Port:", font=("Segoe UI", 9, "bold")).grid(row=1, column=0, sticky="w", pady=6)
+        ent_udp = ttk.Entry(f, width=10)
+        ent_udp.insert(0, str(self.udp_listen_port))
+        ent_udp.grid(row=1, column=1, sticky="w", pady=6)
+        tk.Label(f, text="(matches sender's --udp-port, default 55123)",
+                 font=("Segoe UI", 8), fg="#777777").grid(row=1, column=2, sticky="w", padx=8)
+
+        # TCP host
+        tk.Label(f, text="TCP Host (Pi IP):", font=("Segoe UI", 9, "bold")).grid(row=2, column=0, sticky="w", pady=6)
+        ent_host = ttk.Entry(f, width=18)
+        ent_host.insert(0, self.tcp_host)
+        ent_host.grid(row=2, column=1, sticky="w", pady=6)
+        tk.Label(f, text="(e.g. 192.168.1.50)",
+                 font=("Segoe UI", 8), fg="#777777").grid(row=2, column=2, sticky="w", padx=8)
+
+        # TCP port
+        tk.Label(f, text="TCP Port:", font=("Segoe UI", 9, "bold")).grid(row=3, column=0, sticky="w", pady=6)
+        ent_tcp_port = ttk.Entry(f, width=10)
+        ent_tcp_port.insert(0, str(self.tcp_remote_port))
+        ent_tcp_port.grid(row=3, column=1, sticky="w", pady=6)
+        tk.Label(f, text="(matches sender's --tcp-port, default 55124)",
+                 font=("Segoe UI", 8), fg="#777777").grid(row=3, column=2, sticky="w", padx=8)
+
+        # Sender filter
+        tk.Label(f, text="Sender Filter (Optional):", font=("Segoe UI", 9, "bold")).grid(row=4, column=0, sticky="w", pady=6)
+        ent_filter = ttk.Entry(f, width=18)
+        ent_filter.insert(0, self.net_sender_filter)
+        ent_filter.grid(row=4, column=1, sticky="w", pady=6)
+        tk.Label(f, text="(IP or sender name — leave blank to accept any)",
+                 font=("Segoe UI", 8), fg="#777777").grid(row=4, column=2, sticky="w", padx=8)
+
+        status_lbl = tk.Label(dlg, text="", font=("Segoe UI", 9, "bold"), fg="#c0392b")
+        status_lbl.pack(pady=(4, 0))
+
+        def save_and_connect():
+            try:
+                self.udp_listen_port = int(ent_udp.get().strip())
+            except ValueError:
+                status_lbl.config(text="⚠ UDP Port must be a number (e.g. 55123)")
+                return
+            try:
+                self.tcp_remote_port = int(ent_tcp_port.get().strip())
+            except ValueError:
+                status_lbl.config(text="⚠ TCP Port must be a number (e.g. 55124)")
+                return
+
+            self.tcp_host = ent_host.get().strip()
+            self.net_sender_filter = ent_filter.get().strip()
+
+            sel_mode = var_mode.get()
+            new_mode = "tcp" if sel_mode == "TCP Direct" else "udp"
+
+            if new_mode == "tcp" and not self.tcp_host:
+                status_lbl.config(text="⚠ TCP Direct requires a Host IP address.")
+                return
+
+            self._cbo_net_mode.set(sel_mode)
+            self._var_source.set("network")
+            self.set_source_mode(new_mode)
+            dlg.destroy()
+
+        btn_box = tk.Frame(dlg, pady=8)
+        btn_box.pack(fill=tk.X, padx=28)
+        tk.Button(btn_box, text="Save & Connect", font=("Segoe UI", 9, "bold"),
+                  bg="#17a2b8", fg="#ffffff", command=save_and_connect).pack(side=tk.RIGHT, padx=6)
+        tk.Button(btn_box, text="Cancel", font=("Segoe UI", 9, "bold"),
+                  command=dlg.destroy).pack(side=tk.RIGHT, padx=6)
 
     def open_discord_settings_dialog(self):
         """Opens popup window to configure Discord Webhook alerts."""
@@ -895,6 +1375,11 @@ class SoundMeterApp:
             fg="#ffffff"
         )
         self.reader_thread.set_config(port=port, baudrate=baud, slave_addr=slave)
+        # Also switch source to serial if it wasn't already
+        if self.source_mode != 'serial':
+            self.set_source_mode('serial')
+            self._var_source.set('serial')
+            self._apply_source_widget_visibility()
         self.save_config()
 
     def on_theme_change(self, event=None):
@@ -1278,15 +1763,34 @@ class SoundMeterApp:
                             self.alarm_active = False
                             self.lbl_alarm_badge.config(bg="#222222", fg="#888888", text="ALARM: >105 dB")
 
-                    # Mode & Status Badges
-                    self.lbl_mode_badge.config(text=f"HARDWARE ({port})", bg="#5cb85c", fg="#ffffff")
-                    self.lbl_comm_led.config(text=f"● ONLINE ({port})", fg="#00FF66")
+                    # Mode & Status Badges for OK packets
+                    source = msg.get('source', 'serial')
+                    port_label = msg.get('port', port)
+                    if source in ('udp', 'tcp'):
+                        net_label = 'UDP' if source == 'udp' else 'TCP'
+                        self.lbl_mode_badge.config(
+                            text=f"{net_label}: {port_label}",
+                            bg="#17a2b8", fg="#ffffff"
+                        )
+                        self.lbl_comm_led.config(text=f"● NET ONLINE ({port_label})", fg="#00E5FF")
+                    else:
+                        self.lbl_mode_badge.config(text=f"HARDWARE ({port_label})", bg="#5cb85c", fg="#ffffff")
+                        self.lbl_comm_led.config(text=f"● ONLINE ({port_label})", fg="#00FF66")
                     self.redraw_lcd()
 
                 elif msg['status'] in ('ERROR', 'TIMEOUT'):
                     err_msg = msg.get('error', 'Serial Timeout')
-                    self.lbl_mode_badge.config(text=f"CONNECTING ({port})...", bg="#f0ad4e", fg="#ffffff")
-                    self.lbl_comm_led.config(text=f"● NO RESPONSE ({port})", fg="#FF3333")
+                    source = msg.get('source', 'serial')
+                    port_label = msg.get('port', port)
+                    if source in ('udp', 'tcp'):
+                        self.lbl_mode_badge.config(
+                            text=f"NET: NO SIGNAL ({port_label})",
+                            bg="#d9534f", fg="#ffffff"
+                        )
+                        self.lbl_comm_led.config(text=f"● OFFLINE ({port_label})", fg="#FF3333")
+                    else:
+                        self.lbl_mode_badge.config(text=f"CONNECTING ({port_label})...", bg="#f0ad4e", fg="#ffffff")
+                        self.lbl_comm_led.config(text=f"● NO RESPONSE ({port_label})", fg="#FF3333")
                     self.stat_labels['val_cur'].config(text="0.0 dB")
                     self.current_db = 0.0
                     self.redraw_lcd()
@@ -1303,7 +1807,14 @@ class SoundMeterApp:
 def main():
     root = tk.Tk()
     app = SoundMeterApp(root)
-    root.protocol("WM_DELETE_WINDOW", lambda: (app.reader_thread.stop(), root.destroy()))
+
+    def on_close():
+        app.reader_thread.stop()
+        if app._net_thread and app._net_thread.is_alive():
+            app._net_thread.stop()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
 
 
