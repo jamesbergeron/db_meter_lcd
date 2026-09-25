@@ -109,6 +109,7 @@ class ModbusReaderThread(threading.Thread):
         self.slave_addr = slave_addr
         self.poll_interval = poll_interval
         self.running = True
+        self.enabled = True
         self.ser = None
         self._lock = threading.Lock()
         self._wake_event = threading.Event()
@@ -132,6 +133,18 @@ class ModbusReaderThread(threading.Thread):
             pass
         self._wake_event.set()
 
+    def set_enabled(self, enabled: bool):
+        """Pause polling when another source (UDP/TCP) owns the display."""
+        with self._lock:
+            self.enabled = enabled
+            if not enabled and self.ser:
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
+        self._wake_event.set()
+
     def stop(self):
         self.running = False
         self._wake_event.set()
@@ -140,9 +153,14 @@ class ModbusReaderThread(threading.Thread):
         while self.running:
             self._wake_event.clear()
             with self._lock:
+                enabled = self.enabled
                 port = self.port
                 baudrate = self.baudrate
                 slave_addr = self.slave_addr
+
+            if not enabled:
+                self._wake_event.wait(0.5)
+                continue
 
             if not HAS_SERIAL:
                 self.data_queue.put({
@@ -266,6 +284,7 @@ class UDPListenerThread(threading.Thread):
                 'error': f'UDP bind failed on port {self.udp_port}: {e}',
                 'port': f'UDP:{self.udp_port}',
                 'source': 'udp',
+                'fault': 'transport',
                 'timestamp': datetime.now().strftime("%H:%M:%S")
             })
             return
@@ -289,18 +308,23 @@ class UDPListenerThread(threading.Thread):
                 if self.sender_filter not in addr[0] and self.sender_filter != sender_name:
                     continue
 
-            status = payload.get("status", "OK")
+            status = str(payload.get("status", "OK")).upper()
             db_val = float(payload.get("db", 0.0))
             sender_id = f"{addr[0]} ({payload.get('sender', 'unknown')})"
 
-            self.data_queue.put({
+            msg = {
                 'status': status,
                 'db': db_val,
                 'error': payload.get("error", ""),
                 'port': sender_id,
                 'source': 'udp',
                 'timestamp': payload.get("timestamp", datetime.now().strftime("%H:%M:%S"))
-            })
+            }
+            # A parsed datagram means the link is up. TIMEOUT/ERROR here is a
+            # missed sensor poll, not a transport disconnect.
+            if status != 'OK':
+                msg['fault'] = 'sensor'
+            self.data_queue.put(msg)
 
         if self._sock:
             try:
@@ -334,6 +358,17 @@ class TCPClientThread(threading.Thread):
             except Exception:
                 pass
 
+    def _put_transport_error(self, error: str):
+        self.data_queue.put({
+            'status': 'ERROR',
+            'db': 0.0,
+            'error': f'TCP: {error} ({self.host}:{self.tcp_port})',
+            'port': f'{self.host}:{self.tcp_port}',
+            'source': 'tcp',
+            'fault': 'transport',
+            'timestamp': datetime.now().strftime("%H:%M:%S")
+        })
+
     def run(self):
         backoff = 1.0
         while self.running:
@@ -344,11 +379,12 @@ class TCPClientThread(threading.Thread):
                 self._sock.settimeout(2.0)
                 backoff = 1.0  # reset on successful connect
 
+                # Handshake only — do not publish db 0.0 or it zeros a live display.
                 self.data_queue.put({
-                    'status': 'OK',
-                    'db': 0.0,
+                    'status': 'CONNECTED',
                     'port': f'{self.host}:{self.tcp_port}',
                     'source': 'tcp',
+                    'fault': 'transport',
                     'timestamp': datetime.now().strftime("%H:%M:%S")
                 })
 
@@ -359,9 +395,13 @@ class TCPClientThread(threading.Thread):
                     except socket.timeout:
                         continue
                     except (OSError, ConnectionResetError):
+                        if self.running:
+                            self._put_transport_error('TCP connection lost')
                         break
 
                     if not chunk:
+                        if self.running:
+                            self._put_transport_error('TCP connection closed')
                         break
 
                     buf += chunk
@@ -372,18 +412,23 @@ class TCPClientThread(threading.Thread):
                         except (json.JSONDecodeError, UnicodeDecodeError):
                             continue
 
-                        status = payload.get("status", "OK")
+                        status = str(payload.get("status", "OK")).upper()
                         db_val = float(payload.get("db", 0.0))
                         sender_id = f"{self.host}:{self.tcp_port}"
 
-                        self.data_queue.put({
+                        msg = {
                             'status': status,
                             'db': db_val,
                             'error': payload.get("error", ""),
                             'port': sender_id,
                             'source': 'tcp',
                             'timestamp': payload.get("timestamp", datetime.now().strftime("%H:%M:%S"))
-                        })
+                        }
+                        # Parsed line means the socket is still up. A TIMEOUT/ERROR
+                        # payload is a missed sensor poll, not a dropped link.
+                        if status != 'OK':
+                            msg['fault'] = 'sensor'
+                        self.data_queue.put(msg)
 
             except (OSError, ConnectionRefusedError, socket.timeout) as e:
                 self.data_queue.put({
@@ -392,6 +437,7 @@ class TCPClientThread(threading.Thread):
                     'error': f'TCP: Cannot connect to {self.host}:{self.tcp_port} — {e}',
                     'port': f'{self.host}:{self.tcp_port}',
                     'source': 'tcp',
+                    'fault': 'transport',
                     'timestamp': datetime.now().strftime("%H:%M:%S")
                 })
             finally:
@@ -508,6 +554,9 @@ class SoundMeterApp:
         self.tcp_remote_port = 55124
         self.net_sender_filter = ''
         self._net_thread = None       # Active network thread (UDPListenerThread or TCPClientThread)
+        # Consecutive sensor misses (link still up) before the network badge goes offline.
+        self._net_miss_count = 0
+        self._net_miss_limit = 3
 
         # Load persistent configuration from config.json
         self.load_config()
@@ -985,7 +1034,10 @@ class SoundMeterApp:
             pass
 
         self.source_mode = mode
+        self._net_miss_count = 0
         self._var_source.set("serial" if mode == "serial" else "network")
+        # Serial timeouts must not land on the display while a network source is active.
+        self.reader_thread.set_enabled(mode == 'serial')
 
         if mode == 'serial':
             # Serial thread is always running; just let it take over
@@ -1009,8 +1061,10 @@ class SoundMeterApp:
                     "TCP Host Required",
                     "Please enter the Raspberry Pi IP address in Network Settings first."
                 )
-                self.source_mode = 'serial' if startup else self.source_mode
+                self.source_mode = 'serial'
                 self._var_source.set("serial")
+                self.reader_thread.set_enabled(True)
+                self.lbl_mode_badge.config(text="CONNECTING...", bg="#f0ad4e", fg="#ffffff")
                 return
             self._net_thread = TCPClientThread(
                 data_queue=self.data_queue,
@@ -1707,6 +1761,26 @@ class SoundMeterApp:
 
         self.root.after(200, self.update_flash_cycle)
 
+    def _show_network_online(self, source: str, port_label: str):
+        """Restore the online badge without touching the last dB reading."""
+        net_label = 'UDP' if source == 'udp' else 'TCP'
+        self.lbl_mode_badge.config(
+            text=f"{net_label}: {port_label}",
+            bg="#17a2b8", fg="#ffffff"
+        )
+        self.lbl_comm_led.config(text=f"● NET ONLINE ({port_label})", fg="#00E5FF")
+
+    def _show_network_offline(self, port_label: str):
+        """Mark the network source down and clear the live reading."""
+        self.lbl_mode_badge.config(
+            text=f"NET: NO SIGNAL ({port_label})",
+            bg="#d9534f", fg="#ffffff"
+        )
+        self.lbl_comm_led.config(text=f"● OFFLINE ({port_label})", fg="#FF3333")
+        self.stat_labels['val_cur'].config(text="0.0 dB")
+        self.current_db = 0.0
+        self.redraw_lcd()
+
     def process_queue(self):
         """Processes telemetry data coming from ModbusReaderThread."""
         try:
@@ -1714,8 +1788,19 @@ class SoundMeterApp:
                 msg = self.data_queue.get_nowait()
                 mode = msg.get('mode', 'HARDWARE')
                 port = msg.get('port', self.cbo_port.get().strip())
+                source = msg.get('source', 'serial')
+                status = str(msg.get('status', '')).upper()
 
-                if msg['status'] == 'OK':
+                # COM-port timeouts must not blank a live network reading.
+                if source == 'serial' and self.source_mode != 'serial':
+                    continue
+
+                if status == 'CONNECTED' and source in ('udp', 'tcp'):
+                    self._net_miss_count = 0
+                    self._show_network_online(source, msg.get('port', port))
+                    continue
+
+                if status == 'OK':
                     raw_val = msg['db']
                     # Apply piecewise linear calibration if enabled
                     if self.calibration_enabled and len(self.calibration_points) >= 2:
@@ -1764,36 +1849,32 @@ class SoundMeterApp:
                             self.lbl_alarm_badge.config(bg="#222222", fg="#888888", text="ALARM: >105 dB")
 
                     # Mode & Status Badges for OK packets
-                    source = msg.get('source', 'serial')
                     port_label = msg.get('port', port)
                     if source in ('udp', 'tcp'):
-                        net_label = 'UDP' if source == 'udp' else 'TCP'
-                        self.lbl_mode_badge.config(
-                            text=f"{net_label}: {port_label}",
-                            bg="#17a2b8", fg="#ffffff"
-                        )
-                        self.lbl_comm_led.config(text=f"● NET ONLINE ({port_label})", fg="#00E5FF")
+                        self._net_miss_count = 0
+                        self._show_network_online(source, port_label)
                     else:
                         self.lbl_mode_badge.config(text=f"HARDWARE ({port_label})", bg="#5cb85c", fg="#ffffff")
                         self.lbl_comm_led.config(text=f"● ONLINE ({port_label})", fg="#00FF66")
                     self.redraw_lcd()
 
-                elif msg['status'] in ('ERROR', 'TIMEOUT'):
-                    err_msg = msg.get('error', 'Serial Timeout')
-                    source = msg.get('source', 'serial')
+                elif status in ('ERROR', 'TIMEOUT'):
                     port_label = msg.get('port', port)
                     if source in ('udp', 'tcp'):
-                        self.lbl_mode_badge.config(
-                            text=f"NET: NO SIGNAL ({port_label})",
-                            bg="#d9534f", fg="#ffffff"
-                        )
-                        self.lbl_comm_led.config(text=f"● OFFLINE ({port_label})", fg="#FF3333")
+                        # Sensor miss while the socket is still up: hold the last
+                        # reading. Only a real transport failure, or several misses
+                        # in a row, drops the badge and clears the display.
+                        if msg.get('fault') == 'sensor':
+                            self._net_miss_count += 1
+                            if self._net_miss_count < self._net_miss_limit:
+                                continue
+                        self._show_network_offline(port_label)
                     else:
                         self.lbl_mode_badge.config(text=f"CONNECTING ({port_label})...", bg="#f0ad4e", fg="#ffffff")
                         self.lbl_comm_led.config(text=f"● NO RESPONSE ({port_label})", fg="#FF3333")
-                    self.stat_labels['val_cur'].config(text="0.0 dB")
-                    self.current_db = 0.0
-                    self.redraw_lcd()
+                        self.stat_labels['val_cur'].config(text="0.0 dB")
+                        self.current_db = 0.0
+                        self.redraw_lcd()
 
         except queue.Empty:
             pass
