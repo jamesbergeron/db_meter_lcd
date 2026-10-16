@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#0a120b" />
+  <title>dB Sound Level Monitor</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>DECIBEL SOUND LEVEL MONITOR</h1>
+    <div class="badges">
+      <span id="badge-conn" class="badge offline">● CONNECTING</span>
+      <span id="badge-alarm" class="badge">ALARM: &gt;105 dB</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="display-panel" id="display-panel">
+      <div id="alarm-banner" class="alarm-banner"></div>
+      <div>
+        <span id="db-display" class="db-value">—</span><span class="db-unit">dB</span>
+      </div>
+      <div class="bar-wrap">
+        <div id="bar-track" class="bar-track" aria-hidden="true"></div>
+        <div class="bar-labels">
+          <span>30 dB</span>
+          <span>80 dB</span>
+          <span>105 dB</span>
+          <span>110 dB</span>
+        </div>
+      </div>
+    </section>
+
+    <div class="stats">
+      <div class="stat-card">
+        <div class="label">Min</div>
+        <div class="value" id="stat-min">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Average</div>
+        <div class="value" id="stat-avg">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Max</div>
+        <div class="value" id="stat-max">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Current</div>
+        <div class="value" id="stat-cur">—</div>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <button type="button" class="secondary" id="btn-reset-stats">Reset stats</button>
+      <button type="button" class="primary" id="btn-settings">Settings</button>
+    </div>
+  </main>
+
+  <footer>
+    Live data from db_meter_sender via db_meter_bridge · LAN use only
+  </footer>
+
+  <dialog id="settings-dialog">
+    <div class="dialog-header">
+      <h2>Settings</h2>
+      <p style="margin:0.35rem 0 0;font-size:0.85rem;color:#3c8c56">
+        Saved on the Pi to <strong>web_config.json</strong> (same folder as the bridge).
+      </p>
+    </div>
+    <div class="dialog-body">
+      <div class="section-title">Sender connection</div>
+      <label for="cfg-tcp-host">TCP host (Pi: 127.0.0.1)</label>
+      <input type="text" id="cfg-tcp-host" autocomplete="off" />
+      <label for="cfg-tcp-port">TCP port</label>
+      <input type="number" id="cfg-tcp-port" min="1" max="65535" />
+
+      <div class="section-title">Alarm</div>
+      <label for="cfg-threshold">Threshold (dB)</label>
+      <input type="number" id="cfg-threshold" step="0.1" min="0" max="200" />
+      <label for="cfg-cooldown">Notification cooldown (seconds)</label>
+      <input type="number" id="cfg-cooldown" min="5" max="3600" />
+
+      <div class="section-title">Discord</div>
+      <div class="row-check">
+        <input type="checkbox" id="cfg-discord-enabled" />
+        <label for="cfg-discord-enabled" style="margin:0">Enable Discord alerts over threshold</label>
+      </div>
+      <label for="cfg-discord-url">Webhook URL</label>
+      <input type="url" id="cfg-discord-url" placeholder="https://discord.com/api/webhooks/..." />
+      <label for="cfg-discord-user">User ID to ping (optional)</label>
+      <input type="text" id="cfg-discord-user" autocomplete="off" />
+      <button type="button" class="danger" id="btn-test-discord">Test Discord</button>
+
+      <div class="section-title">ntfy</div>
+      <div class="row-check">
+        <input type="checkbox" id="cfg-ntfy-enabled" />
+        <label for="cfg-ntfy-enabled" style="margin:0">Enable ntfy push over threshold</label>
+      </div>
+      <label for="cfg-ntfy-server">Server URL</label>
+      <input type="url" id="cfg-ntfy-server" placeholder="https://ntfy.sh" />
+      <label for="cfg-ntfy-topic">Topic (subscribe in ntfy app)</label>
+      <input type="text" id="cfg-ntfy-topic" autocomplete="off" />
+      <label for="cfg-ntfy-priority">Priority</label>
+      <input type="text" id="cfg-ntfy-priority" placeholder="high" />
+      <button type="button" class="success" id="btn-test-ntfy">Test ntfy</button>
+
+      <p id="settings-status" class="status-msg"></p>
+    </div>
+    <div class="dialog-footer">
+      <button type="button" class="secondary" id="btn-close-settings">Close</button>
+      <button type="button" class="primary" id="btn-save">Save settings</button>
+    </div>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
