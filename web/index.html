@@ -6,13 +6,13 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="theme-color" content="#0a120b" />
   <title>dB Sound Level Monitor</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v=5" />
 </head>
 <body>
   <header>
     <h1>DECIBEL SOUND LEVEL MONITOR</h1>
     <div class="badges">
-      <span id="badge-conn" class="badge offline">● CONNECTING</span>
+      <span id="badge-conn" class="badge offline">● LOADING…</span>
       <span id="badge-alarm" class="badge">ALARM: &gt;105 dB</span>
     </div>
   </header>
@@ -21,7 +21,7 @@
     <section class="display-panel" id="display-panel">
       <div id="alarm-banner" class="alarm-banner"></div>
       <div>
-        <span id="db-display" class="db-value">—</span><span class="db-unit">dB</span>
+        <span id="db-display" class="db-value">—</span><span class="db-unit">dB</span><span id="cal-badge" class="cal-badge" hidden>CAL</span>
       </div>
       <div class="bar-wrap">
         <div id="bar-track" class="bar-track" aria-hidden="true"></div>
@@ -58,6 +58,8 @@
       <button type="button" class="primary" id="btn-settings">Settings</button>
     </div>
   </main>
+
+  <div id="boot-error" class="boot-error" hidden></div>
 
   <footer>
     Live data from db_meter_sender via db_meter_bridge · LAN use only
@@ -115,6 +117,6 @@
     </div>
   </dialog>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=5" defer></script>
 </body>
 </html>

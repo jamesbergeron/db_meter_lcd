@@ -50,6 +50,8 @@ CONFIG_KEYS = (
     "ntfy_priority",
     "http_port",
     "http_bind",
+    "calibration_enabled",
+    "calibration_points",
 )
 
 DEFAULTS: dict[str, Any] = {
@@ -66,7 +68,50 @@ DEFAULTS: dict[str, Any] = {
     "ntfy_priority": "high",
     "http_port": 8080,
     "http_bind": "0.0.0.0",
+    "calibration_enabled": False,
+    "calibration_points": [],
 }
+
+
+def normalize_calibration_points(raw: Any) -> list[list[float]]:
+    pts: list[list[float]] = []
+    if not isinstance(raw, list):
+        return pts
+    for p in raw:
+        if isinstance(p, (list, tuple)) and len(p) == 2:
+            try:
+                pts.append([float(p[0]), float(p[1])])
+            except (TypeError, ValueError):
+                continue
+    return pts
+
+
+def apply_calibration(raw_db: float, points: list[list[float]]) -> float:
+    """Piecewise linear calibration (same algorithm as db_meter_gui.py)."""
+    pts = sorted(points, key=lambda p: p[0])
+    if len(pts) < 2:
+        return raw_db
+
+    if raw_db <= pts[0][0]:
+        x0, y0 = pts[0]
+        x1, y1 = pts[1]
+        slope = (y1 - y0) / (x1 - x0) if x1 != x0 else 1.0
+        return y0 + slope * (raw_db - x0)
+
+    if raw_db >= pts[-1][0]:
+        x0, y0 = pts[-2]
+        x1, y1 = pts[-1]
+        slope = (y1 - y0) / (x1 - x0) if x1 != x0 else 1.0
+        return y1 + slope * (raw_db - x1)
+
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i]
+        x1, y1 = pts[i + 1]
+        if x0 <= raw_db <= x1:
+            t = (raw_db - x0) / (x1 - x0) if x1 != x0 else 0.0
+            return y0 + t * (y1 - y0)
+
+    return raw_db
 
 
 def load_config(path: str) -> dict[str, Any]:
@@ -101,6 +146,8 @@ def normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     out["ntfy_topic"] = str(out["ntfy_topic"]).strip()
     out["ntfy_priority"] = str(out["ntfy_priority"]).strip() or "high"
     out["http_bind"] = str(out["http_bind"]).strip() or "0.0.0.0"
+    out["calibration_enabled"] = bool(out.get("calibration_enabled", False))
+    out["calibration_points"] = normalize_calibration_points(out.get("calibration_points", []))
     return out
 
 
@@ -221,6 +268,7 @@ class TelemetryHub:
         self.source_label = ""
         self.alarm_active = False
         self.last_error = ""
+        self.last_raw_db: float | None = None
 
     def reset_stats(self):
         self.min_db: float | None = None
@@ -272,7 +320,11 @@ class TelemetryHub:
             self.connected = transport_up
 
             if status == "OK":
-                db_val = float(payload.get("db", 0.0))
+                raw_db = float(payload.get("db", 0.0))
+                self.last_raw_db = raw_db
+                db_val = raw_db
+                if cfg["calibration_enabled"] and len(cfg["calibration_points"]) >= 2:
+                    db_val = apply_calibration(raw_db, cfg["calibration_points"])
                 self.db = db_val
                 self.sample_count += 1
                 self.sum_db += db_val
@@ -349,8 +401,14 @@ class TelemetryHub:
     def _build_snapshot(self) -> dict[str, Any]:
         """Build JSON state; caller must hold self._lock."""
         avg = (self.sum_db / self.sample_count) if self.sample_count else None
+        cal_on = (
+            bool(self.config.get("calibration_enabled"))
+            and len(self.config.get("calibration_points", [])) >= 2
+        )
         return {
             "db": self.db,
+            "raw_db": self.last_raw_db if cal_on else None,
+            "calibration_enabled": cal_on,
             "status": self.status,
             "connected": self.connected,
             "min_db": self.min_db,

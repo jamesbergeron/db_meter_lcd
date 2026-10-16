@@ -132,6 +132,11 @@ Default settings live in **`web_config.json`** in this repo (copied to the Pi wi
 | `discord_*` | Same webhook style as the desktop GUI |
 | `ntfy_*` | Subscribe to `ntfy_topic` in the [ntfy app](https://ntfy.sh/) (`ntfy_server` default `https://ntfy.sh`) |
 | `http_port` / `http_bind` | Web server listen address (restart bridge after changing these) |
+| `calibration_enabled` / `calibration_points` | Same format as `config.json` for the desktop GUI |
+
+`web_config.json` in the repo is pre-filled to match the usual desktop `config.json` values (alarm, Discord, calibration, TCP). Desktop-only keys (`port`, `baudrate`, `theme`, `source_mode`, `udp_listen_port`, etc.) remain in **`config.json`** for `db_meter_gui.py` only.
+
+**Pi tip:** If `db_meter_sender.py` and `db_meter_bridge.py` both run on the Pi, set `tcp_host` to **`127.0.0.1`** instead of the Pi’s LAN IP.
 
 **Security:** The Web UI has no login; use only on a trusted home LAN. Webhooks and ntfy topics are stored in plain JSON on the Pi.
 

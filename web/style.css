@@ -122,6 +122,16 @@ main {
   margin-left: 0.25rem;
 }
 
+.cal-badge {
+  display: inline-block;
+  margin-left: 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 800;
+  color: #27ae60;
+  vertical-align: middle;
+  letter-spacing: 0.06em;
+}
+
 .stats {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
@@ -235,6 +245,12 @@ button.success {
   color: #fff;
 }
 
+/* Closed <dialog> must not sit on top of the page (Safari / iOS touch bug). */
+dialog:not([open]) {
+  display: none !important;
+  pointer-events: none !important;
+}
+
 dialog {
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -243,6 +259,18 @@ dialog {
   max-width: 520px;
   width: calc(100% - 2rem);
   padding: 0;
+  margin: auto;
+  z-index: 1000;
+}
+
+dialog[open].settings-fallback {
+  display: block;
+  position: fixed;
+  inset: 0;
+  width: min(520px, calc(100% - 2rem));
+  max-height: 90vh;
+  overflow: auto;
+  top: 5vh;
 }
 
 dialog::backdrop {
@@ -334,4 +362,21 @@ footer {
   font-size: 0.7rem;
   color: var(--subtext);
   padding: 1rem;
+}
+
+.boot-error {
+  margin: 0 1.25rem 1rem;
+  padding: 0.75rem;
+  background: #4a0000;
+  color: #ffb3b3;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+
+.toolbar button {
+  position: relative;
+  z-index: 2;
+  touch-action: manipulation;
+  min-height: 44px;
 }

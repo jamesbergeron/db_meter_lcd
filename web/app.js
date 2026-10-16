@@ -17,7 +17,8 @@ let state = {
 let peakHold = 30;
 let peakTimer = 0;
 let flashOn = false;
-let eventSource = null;
+let pollTimer = null;
+const POLL_MS = 1000;
 
 const el = {
   db: document.getElementById("db-display"),
@@ -32,7 +33,39 @@ const el = {
   barTrack: document.getElementById("bar-track"),
   settingsDialog: document.getElementById("settings-dialog"),
   statusMsg: document.getElementById("settings-status"),
+  bootError: document.getElementById("boot-error"),
+  calBadge: document.getElementById("cal-badge"),
 };
+
+function showBootError(msg) {
+  if (!el.bootError) return;
+  el.bootError.hidden = false;
+  el.bootError.textContent = msg;
+}
+
+function openSettingsDialog() {
+  const dlg = el.settingsDialog;
+  if (!dlg) return;
+  dlg.classList.add("settings-fallback");
+  if (typeof dlg.showModal === "function") {
+    try {
+      dlg.showModal();
+      return;
+    } catch (e) {
+      console.warn("showModal failed, using fallback", e);
+    }
+  }
+  dlg.setAttribute("open", "");
+}
+
+function closeSettingsDialog() {
+  const dlg = el.settingsDialog;
+  if (!dlg) return;
+  if (typeof dlg.close === "function" && dlg.open) {
+    dlg.close();
+  }
+  dlg.removeAttribute("open");
+}
 
 function formatDb(v) {
   if (v == null || Number.isNaN(v)) return "—";
@@ -105,14 +138,39 @@ function applyTelemetry(data) {
   el.db.textContent = dbStr;
   el.db.classList.toggle("alarm", state.alarm_active);
 
-  if (state.connected && state.status === "OK") {
+  if (el.calBadge) {
+    const showCal = !!data.calibration_enabled;
+    el.calBadge.hidden = !showCal;
+    if (showCal && data.raw_db != null && state.status === "OK") {
+      el.calBadge.title = `Raw sensor: ${Number(data.raw_db).toFixed(1)} dB`;
+    } else {
+      el.calBadge.title = "Calibration active";
+    }
+  }
+
+  if (state.status === "CONNECTING") {
+    el.badgeConn.textContent = "● CONNECTING TO SENDER…";
+    el.badgeConn.className = "badge offline";
+  } else if (state.connected && state.status === "OK") {
     el.badgeConn.textContent = `● ONLINE (${data.source_label || "NET"})`;
+    el.badgeConn.className = "badge online";
+  } else if (state.connected && state.status === "CONNECTED") {
+    el.badgeConn.textContent = `● LINKED (${data.source_label || "sender"})`;
     el.badgeConn.className = "badge online";
   } else if (state.connected) {
     el.badgeConn.textContent = `● SENSOR (${state.status})`;
     el.badgeConn.className = "badge offline";
   } else {
-    el.badgeConn.textContent = "● OFFLINE";
+    el.badgeConn.title = data.error || "";
+    const shortErr = (data.error || "no data from sender").replace(
+      /\[Errno \d+\] /,
+      ""
+    );
+    const label =
+      shortErr.length <= 36
+        ? `● SENDER OFFLINE — ${shortErr}`
+        : "● SENDER OFFLINE — check sender on Pi";
+    el.badgeConn.textContent = label;
     el.badgeConn.className = "badge offline";
   }
 
@@ -123,23 +181,29 @@ function applyTelemetry(data) {
   updateBar(state.db);
 }
 
-function connectStream() {
-  if (eventSource) {
-    eventSource.close();
-  }
-  eventSource = new EventSource("/api/stream");
-  eventSource.onmessage = (ev) => {
-    try {
-      const data = JSON.parse(ev.data);
-      applyTelemetry(data);
-    } catch (e) {
-      console.warn("Bad SSE payload", e);
-    }
-  };
-  eventSource.onerror = () => {
-    el.badgeConn.textContent = "● RECONNECTING…";
+async function refreshLatest() {
+  try {
+    const res = await fetch("/api/latest", { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (el.bootError) el.bootError.hidden = true;
+    applyTelemetry(data);
+    return true;
+  } catch (e) {
+    showBootError(
+      "Cannot reach the bridge API. Use http://<pi-ip>:8080/ while db_meter_bridge.py is running."
+    );
+    el.badgeConn.textContent = "● BRIDGE UNREACHABLE";
     el.badgeConn.className = "badge offline";
-  };
+    return false;
+  }
+}
+
+/** Polling is more reliable than SSE on iPhone / Safari. */
+function startLiveUpdates() {
+  if (pollTimer) clearInterval(pollTimer);
+  refreshLatest();
+  pollTimer = setInterval(refreshLatest, POLL_MS);
 }
 
 async function loadConfigIntoForm() {
@@ -233,26 +297,44 @@ function resetStats() {
   fetch("/api/stats/reset", { method: "POST" }).catch(() => {});
 }
 
-document.getElementById("btn-settings").addEventListener("click", async () => {
-  await loadConfigIntoForm();
-  setStatusMsg("", true);
-  el.settingsDialog.showModal();
-});
-
-document.getElementById("btn-save").addEventListener("click", saveSettings);
-document.getElementById("btn-test-discord").addEventListener("click", testDiscord);
-document.getElementById("btn-test-ntfy").addEventListener("click", testNtfy);
-document.getElementById("btn-reset-stats").addEventListener("click", resetStats);
-document.getElementById("btn-close-settings").addEventListener("click", () => el.settingsDialog.close());
-
-setInterval(() => {
-  if (!state.alarm_active) {
-    document.body.classList.remove("alarm-flash");
-    return;
+function initApp() {
+  try {
+    buildBar();
+    startLiveUpdates();
+  } catch (e) {
+    console.error(e);
+    showBootError(`UI failed to start: ${e.message}`);
   }
-  flashOn = !flashOn;
-  document.body.classList.toggle("alarm-flash", flashOn);
-}, 200);
 
-buildBar();
-connectStream();
+  document.getElementById("btn-settings").addEventListener("click", async () => {
+    try {
+      await loadConfigIntoForm();
+      setStatusMsg("", true);
+      openSettingsDialog();
+    } catch (e) {
+      setStatusMsg(e.message || "Could not load settings", false);
+      openSettingsDialog();
+    }
+  });
+
+  document.getElementById("btn-save").addEventListener("click", saveSettings);
+  document.getElementById("btn-test-discord").addEventListener("click", testDiscord);
+  document.getElementById("btn-test-ntfy").addEventListener("click", testNtfy);
+  document.getElementById("btn-reset-stats").addEventListener("click", resetStats);
+  document.getElementById("btn-close-settings").addEventListener("click", closeSettingsDialog);
+
+  setInterval(() => {
+    if (!state.alarm_active) {
+      document.body.classList.remove("alarm-flash");
+      return;
+    }
+    flashOn = !flashOn;
+    document.body.classList.toggle("alarm-flash", flashOn);
+  }, 200);
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initApp);
+} else {
+  initApp();
+}
