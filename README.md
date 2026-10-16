@@ -84,11 +84,74 @@ python3 db_meter_gui.py
 
 ---
 
+## Network sender (Raspberry Pi)
+
+`db_meter_sender.py` reads the Modbus sensor over USB/RS485 and streams JSON on the LAN:
+
+- **UDP broadcast** — port `55123` (auto-discovery style)
+- **TCP server** — port `55124` (direct connections; used by the Web UI bridge)
+
+See `db_meter_sender.py --help` for serial port and interval options.
+
+---
+
+## Web UI (iPhone & Android on the same Wi‑Fi)
+
+`db_meter_bridge.py` serves a mobile-friendly dashboard and sends **over-threshold** alerts via **Discord** and/or **ntfy** (phone push even when the browser is closed).
+
+### On the Pi
+
+1. Install dependencies (includes Flask):
+
+   ```bash
+   pip3 install -r requirements.txt
+   ```
+
+2. Start the sender (sensor attached):
+
+   ```bash
+   python3 db_meter_sender.py
+   ```
+
+3. Start the bridge (same machine; default TCP `127.0.0.1:55124`):
+
+   ```bash
+   python3 db_meter_bridge.py
+   ```
+
+4. On your phone, open `http://<pi-ip>:8080/` (default HTTP port from `web_config.json`).
+
+### Configuration
+
+Default settings live in **`web_config.json`** in this repo (copied to the Pi with the project). You can edit that file directly or use **Settings** in the Web UI — **Save settings** writes back to `web_config.json` on the Pi.
+
+| Setting | Purpose |
+|--------|---------|
+| `tcp_host` / `tcp_port` | Where the bridge connects to `db_meter_sender` (`127.0.0.1:55124` on the Pi) |
+| `alarm_threshold` / `alarm_cooldown_seconds` | When to alert and minimum time between alerts |
+| `discord_*` | Same webhook style as the desktop GUI |
+| `ntfy_*` | Subscribe to `ntfy_topic` in the [ntfy app](https://ntfy.sh/) (`ntfy_server` default `https://ntfy.sh`) |
+| `http_port` / `http_bind` | Web server listen address (restart bridge after changing these) |
+
+**Security:** The Web UI has no login; use only on a trusted home LAN. Webhooks and ntfy topics are stored in plain JSON on the Pi.
+
+### ntfy quick setup
+
+1. Install the ntfy app on your phone.
+2. Subscribe to a private topic name (e.g. `my-garage-meter-8f3k`).
+3. Enter that topic in Web UI → Settings → ntfy → **Test ntfy** → enable alerts → **Save settings**.
+
+---
+
 ## File Structure
 
 ```
 db_meter_lcd/
-├── db_meter_gui.py     # Main GUI application script
-├── requirements.txt    # Python dependencies
-└── README.md           # Documentation
+├── db_meter_gui.py       # Desktop GUI (Windows / Linux)
+├── db_meter_sender.py    # Pi / headless Modbus → UDP + TCP
+├── db_meter_bridge.py    # Web UI + Discord / ntfy alerts
+├── web_config.json       # Default bridge settings (editable in Web UI)
+├── web/                  # Static Web UI (HTML / CSS / JS)
+├── requirements.txt      # Python dependencies
+└── README.md             # Documentation
 ```

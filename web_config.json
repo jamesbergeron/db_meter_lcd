@@ -1,0 +1,47 @@
+{
+    "tcp_host": "127.0.0.1",
+    "tcp_port": 55124,
+    "alarm_threshold": 105.0,
+    "alarm_cooldown_seconds": 60,
+    "discord_enabled": false,
+    "discord_webhook_url": "",
+    "discord_user_id": "",
+    "ntfy_enabled": false,
+    "ntfy_server": "https://ntfy.sh",
+    "ntfy_topic": "",
+    "ntfy_priority": "high",
+    "http_port": 8080,
+    "http_bind": "0.0.0.0",
+    "calibration_points": [
+        [
+            89.0,
+            80.0
+        ],
+        [
+            92.6,
+            83.6
+        ],
+        [
+            94.0,
+            83.0
+        ],
+        [
+            95.8,
+            89.2
+        ],
+        [
+            102.6,
+            101.5
+        ],
+        [
+            105.8,
+            96.4
+        ],
+        [
+            106.6,
+            97.0
+        ]
+    ],
+    "calibration_enabled": true,
+    "config_note": "Default config for db_meter_bridge.py on the Pi. Edit here or use the Web UI Settings page (saved to this file)."
+}
