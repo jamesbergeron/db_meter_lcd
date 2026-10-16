@@ -231,7 +231,8 @@ class TelemetryHub:
     def reset_stats_and_broadcast(self):
         with self._lock:
             self.reset_stats()
-            self._broadcast()
+            snap = self._build_snapshot()
+        self._fanout(snap)
 
     def subscribe(self) -> queue.Queue:
         q: queue.Queue = queue.Queue(maxsize=8)
@@ -262,6 +263,7 @@ class TelemetryHub:
             return deepcopy(self.config)
 
     def ingest(self, payload: dict[str, Any], source_label: str, transport_up: bool):
+        alert: tuple[float, float, dict[str, Any]] | None = None
         with self._lock:
             cfg = self.config
             status = str(payload.get("status", "OK")).upper()
@@ -282,13 +284,27 @@ class TelemetryHub:
                 threshold = cfg["alarm_threshold"]
                 if db_val >= threshold:
                     self.alarm_active = True
-                    self._maybe_send_alerts(db_val, threshold, cfg)
+                    alert = (db_val, threshold, deepcopy(cfg))
                 else:
                     self.alarm_active = False
             elif not transport_up:
                 self.alarm_active = False
 
-            self._broadcast()
+            snap = self._build_snapshot()
+
+        if alert:
+            self._maybe_send_alerts(alert[0], alert[1], alert[2])
+        self._fanout(snap)
+
+    def set_transport_up(self, source_label: str):
+        """TCP socket to db_meter_sender is open (sensor data may follow)."""
+        with self._lock:
+            self.connected = True
+            self.status = "CONNECTED"
+            self.source_label = source_label
+            self.last_error = ""
+            snap = self._build_snapshot()
+        self._fanout(snap)
 
     def set_transport_down(self, error: str, source_label: str):
         with self._lock:
@@ -297,7 +313,8 @@ class TelemetryHub:
             self.last_error = error
             self.source_label = source_label
             self.alarm_active = False
-            self._broadcast()
+            snap = self._build_snapshot()
+        self._fanout(snap)
 
     def _maybe_send_alerts(self, db_val: float, threshold: float, cfg: dict[str, Any]):
         now = time.time()
@@ -329,23 +346,27 @@ class TelemetryHub:
                 if ok:
                     self._last_ntfy_alert = now
 
+    def _build_snapshot(self) -> dict[str, Any]:
+        """Build JSON state; caller must hold self._lock."""
+        avg = (self.sum_db / self.sample_count) if self.sample_count else None
+        return {
+            "db": self.db,
+            "status": self.status,
+            "connected": self.connected,
+            "min_db": self.min_db,
+            "max_db": self.max_db,
+            "avg_db": avg,
+            "sample_count": self.sample_count,
+            "alarm_threshold": self.config["alarm_threshold"],
+            "alarm_active": self.alarm_active,
+            "source_label": self.source_label,
+            "error": self.last_error,
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+        }
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            avg = (self.sum_db / self.sample_count) if self.sample_count else None
-            return {
-                "db": self.db,
-                "status": self.status,
-                "connected": self.connected,
-                "min_db": self.min_db,
-                "max_db": self.max_db,
-                "avg_db": avg,
-                "sample_count": self.sample_count,
-                "alarm_threshold": self.config["alarm_threshold"],
-                "alarm_active": self.alarm_active,
-                "source_label": self.source_label,
-                "error": self.last_error,
-                "timestamp": datetime.now().strftime("%H:%M:%S"),
-            }
+            return self._build_snapshot()
 
     def _publish_snapshot(self, q: queue.Queue):
         try:
@@ -353,10 +374,11 @@ class TelemetryHub:
         except queue.Full:
             pass
 
-    def _broadcast(self):
-        snap = self.snapshot()
+    def _fanout(self, snap: dict[str, Any]):
+        with self._lock:
+            subscribers = list(self._subscribers)
         dead: list[queue.Queue] = []
-        for q in self._subscribers:
+        for q in subscribers:
             try:
                 q.put_nowait(snap)
             except queue.Full:
@@ -365,9 +387,11 @@ class TelemetryHub:
                     q.put_nowait(snap)
                 except Exception:
                     dead.append(q)
-        for q in dead:
-            if q in self._subscribers:
-                self._subscribers.remove(q)
+        if dead:
+            with self._lock:
+                for q in dead:
+                    if q in self._subscribers:
+                        self._subscribers.remove(q)
 
 
 class TCPIngestThread(threading.Thread):
@@ -401,6 +425,7 @@ class TCPIngestThread(threading.Thread):
                 sock.connect((host, port))
                 sock.settimeout(2.0)
                 backoff = 1.0
+                self.hub.set_transport_up(label)
                 buf = b""
 
                 while self.running and not self._restart.is_set():
@@ -440,6 +465,28 @@ class TCPIngestThread(threading.Thread):
 
             time.sleep(backoff)
             backoff = min(backoff * 2, 15.0)
+
+
+def local_ipv4_addresses() -> list[str]:
+    """Best-effort list of this machine's LAN IPv4 addresses (for startup hints)."""
+    seen: list[str] = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127.") and ip not in seen:
+                seen.append(ip)
+    except OSError:
+        pass
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("8.8.8.8", 80))
+        ip = probe.getsockname()[0]
+        probe.close()
+        if ip not in seen:
+            seen.append(ip)
+    except OSError:
+        pass
+    return seen
 
 
 def create_app(hub: TelemetryHub, ingest: TCPIngestThread) -> Flask:
@@ -506,7 +553,8 @@ def create_app(hub: TelemetryHub, ingest: TCPIngestThread) -> Flask:
                     try:
                         snap = q.get(timeout=15)
                     except queue.Empty:
-                        yield ": keepalive\n\n"
+                        # Periodic snapshot so OFFLINE / error text updates during TCP backoff
+                        yield f"data: {json.dumps(hub.snapshot())}\n\n"
                         continue
                     yield f"data: {json.dumps(snap)}\n\n"
             finally:
@@ -549,8 +597,16 @@ def main():
     print("  db_meter_bridge — Web UI + Discord / ntfy alerts", flush=True)
     print(f"  Config : {config_path}", flush=True)
     print(f"  Sender : TCP {cfg['tcp_host']}:{cfg['tcp_port']}", flush=True)
-    print(f"  HTTP   : http://{cfg['http_bind']}:{cfg['http_port']}/", flush=True)
-    print("  Open this URL on your phone (same Wi‑Fi as the Pi).", flush=True)
+    print(f"  HTTP   : listening on {cfg['http_bind']}:{cfg['http_port']}", flush=True)
+    ips = local_ipv4_addresses()
+    port = cfg["http_port"]
+    if ips:
+        print("  Open on your phone (same network as the Pi):", flush=True)
+        for ip in ips:
+            print(f"    → http://{ip}:{port}/", flush=True)
+    else:
+        print(f"  Open on your phone: http://<pi-ip>:{port}/", flush=True)
+    print("  (Phone Wi‑Fi must be the same subnet, e.g. 10.0.99.x if Pi is 10.0.99.218)", flush=True)
     print("=" * 55, flush=True)
 
     try:
